@@ -1,6 +1,6 @@
 [project]
 name = "polstats"
-version = "0.1.0"
+version = "0.1.1"
 description = "Open data store, REST API and explorer for US national politics: Congress members, terms, and election results"
 readme = "README.md"
 license = "MIT"

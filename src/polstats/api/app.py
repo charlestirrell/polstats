@@ -242,7 +242,7 @@ def _register_resource(app: FastAPI, rtype: str) -> None:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="polstats", version="0.1.0", summary=docs.API_SUMMARY, description=docs.API_DESCRIPTION,
+    app = FastAPI(title="polstats", version="0.1.1", summary=docs.API_SUMMARY, description=docs.API_DESCRIPTION,
                   openapi_tags=docs.openapi_tags(),
                   license_info={"name": "MIT", "url": "https://github.com/charlestirrell/polstats/blob/main/LICENSE"},
                   contact={"name": "polstats on GitHub", "url": docs.README})
@@ -270,7 +270,7 @@ def create_app() -> FastAPI:
     def metadata():
         return {
             "resourceType": "CapabilityStatement",
-            "software": {"name": "polstats", "version": "0.1.0"},
+            "software": {"name": "polstats", "version": "0.1.1"},
             "rest": [{"mode": "server", "resource": [
                 {"type": t,
                  "interaction": [{"code": c} for c in ("read", "vread-history", "search-type",
