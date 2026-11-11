@@ -22,12 +22,14 @@ from typing import Iterator
 
 import psycopg
 from fastapi import Depends, FastAPI, Request
+from fastapi import Path as PathParam
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
 from ..resources import REGISTRY
 from ..store import Store, dsn
+from . import docs
 from .search import INCLUDES, RESERVED, BadRequest, build_where, params_for
 
 DEFAULT_COUNT, MAX_COUNT = 50, 500
@@ -90,8 +92,160 @@ def _etag(doc: dict) -> str:
     return f'W/"{doc["meta"]["versionId"]}"'
 
 
+def search_impl(rtype: str, request: Request, conn: psycopg.Connection) -> dict:
+    cls = _cls(rtype)
+    query = [(k, v) for k, v in request.query_params.multi_items()]
+    where, args = build_where(rtype, query)
+
+    def _int(name: str, default: int, lo: int, hi: int) -> int:
+        raw = request.query_params.get(name)
+        if raw is None:
+            return default
+        try:
+            n = int(raw)
+        except ValueError:
+            raise BadRequest(f"{name} must be an integer")
+        if not lo <= n <= hi:
+            raise BadRequest(f"{name} must be between {lo} and {hi}")
+        return n
+
+    count = _int("_count", DEFAULT_COUNT, 0, MAX_COUNT)
+    offset = _int("_offset", 0, 0, 10**9)
+    total = conn.execute(f"SELECT count(*) FROM {cls.table} r WHERE {where}", args).fetchone()[0]
+    rows = conn.execute(
+        f"SELECT r.resource FROM {cls.table} r WHERE {where} ORDER BY r.last_updated, r.id LIMIT %s OFFSET %s",
+        [*args, count, offset]).fetchall()
+    docs_ = [r[0] for r in rows]
+
+    entries = [{"fullUrl": f"{rtype}/{d['id']}", "resource": d, "search": {"mode": "match"}} for d in docs_]
+
+    # _include=Type:field (repeatable)
+    wanted: dict[str, set[str]] = {}
+    for spec in request.query_params.getlist("_include"):
+        src, _, field = spec.partition(":")
+        if src != rtype or field not in INCLUDES.get(rtype, {}):
+            raise BadRequest(f"unsupported _include {spec!r}; supported: "
+                             f"{[f'{rtype}:{f}' for f in INCLUDES.get(rtype, {})]}")
+        target_type = INCLUDES[rtype][field]
+        for d in docs_:
+            ref = (d.get(field) or {}).get("reference", "")
+            if ref.startswith(target_type + "/") and _valid_id(ref.split("/", 1)[1]):
+                wanted.setdefault(target_type, set()).add(ref.split("/", 1)[1])
+    for ttype, ids in wanted.items():
+        inc = conn.execute(f"SELECT resource FROM {REGISTRY[ttype].table} WHERE id = ANY(%s::uuid[])",
+                           [sorted(ids)]).fetchall()
+        entries += [{"fullUrl": f"{ttype}/{r[0]['id']}", "resource": r[0], "search": {"mode": "include"}}
+                    for r in inc]
+
+    links = [{"relation": "self", "url": str(request.url)}]
+    if offset + count < total:
+        links.append({"relation": "next",
+                      "url": str(request.url.include_query_params(_offset=offset + count, _count=count))})
+    return {"resourceType": "Bundle", "type": "searchset", "total": total, "link": links, "entry": entries}
+
+
+def read_impl(rtype: str, rid: str, conn: psycopg.Connection) -> JSONResponse:
+    cls = _cls(rtype)
+    row = conn.execute(f"SELECT resource FROM {cls.table} WHERE id = %s::uuid", [rid]).fetchone() \
+        if _valid_id(rid) else None
+    if row is None:
+        raise LookupError(f"{rtype}/{rid} not found")
+    doc = row[0]
+    return JSONResponse(doc, headers={"ETag": _etag(doc), "Last-Modified": doc["meta"]["lastUpdated"]})
+
+
+def history_impl(rtype: str, rid: str, conn: psycopg.Connection) -> dict:
+    cls = _cls(rtype)
+    rows = conn.execute(
+        f"SELECT resource FROM {cls.table}_history WHERE id = %s::uuid ORDER BY version_id DESC", [rid]
+    ).fetchall() if _valid_id(rid) else []
+    if not rows:
+        raise LookupError(f"{rtype}/{rid} not found")
+    return {"resourceType": "Bundle", "type": "history", "total": len(rows),
+            "entry": [{"fullUrl": f"{rtype}/{rid}/_history/{r[0]['meta']['versionId']}", "resource": r[0]}
+                      for r in rows]}
+
+
+def _parse(cls, rtype: str, body: dict):
+    if not isinstance(body, dict) or body.get("resourceType") != rtype:
+        raise BadRequest(f"body must be a JSON object with resourceType {rtype!r}")
+    try:
+        return cls.model_validate(body)
+    except ValidationError as e:
+        raise BadRequest("; ".join(f"{'.'.join(map(str, x['loc']))}: {x['msg']}" for x in e.errors()))
+
+
+async def create_impl(rtype: str, request: Request, conn: psycopg.Connection) -> JSONResponse:
+    cls = _cls(rtype)
+    try:
+        body = await request.json()
+    except ValueError:
+        raise BadRequest("body is not valid JSON")
+    res = _parse(cls, rtype, {k: v for k, v in body.items() if k not in ("id", "meta")} if isinstance(body, dict) else body)
+    saved = Store(conn).create(res)
+    doc = saved.model_dump(mode="json", exclude_none=True)
+    return JSONResponse(doc, status_code=201,
+                        headers={"Location": f"/{rtype}/{saved.id}/_history/1", "ETag": _etag(doc)})
+
+
+async def update_impl(rtype: str, rid: str, request: Request, conn: psycopg.Connection) -> JSONResponse:
+    cls = _cls(rtype)
+    try:
+        body = await request.json()
+    except ValueError:
+        raise BadRequest("body is not valid JSON")
+    res = _parse(cls, rtype, body)
+    if res.id != rid:
+        raise BadRequest("body id must match URL id")
+    row = conn.execute(f"SELECT resource FROM {cls.table} WHERE id = %s::uuid", [rid]).fetchone() \
+        if _valid_id(rid) else None
+    if row is None:
+        raise LookupError(f"{rtype}/{rid} not found (PUT does not create)")
+    if_match = request.headers.get("If-Match")
+    if if_match and if_match != _etag(row[0]):
+        return outcome(412, "error", "conflict", f"version mismatch; current is {_etag(row[0])}")
+    saved = Store(conn).update(res)
+    doc = saved.model_dump(mode="json", exclude_none=True)
+    return JSONResponse(doc, headers={"ETag": _etag(doc)})
+
+
+Conn = Depends(get_conn)
+RidParam = PathParam(description=docs.ID_DESCRIPTION)
+
+
+def _register_resource(app: FastAPI, rtype: str) -> None:
+    """Documented routes for one resource type. Each is a thin wrapper over the shared implementation above."""
+    d = docs.route_docs(rtype)
+    path = f"/{rtype}"
+
+    def search(request: Request, conn: psycopg.Connection = Conn):
+        return search_impl(rtype, request, conn)
+
+    def read(rid: str = RidParam, conn: psycopg.Connection = Conn):
+        return read_impl(rtype, rid, conn)
+
+    def history(rid: str = RidParam, conn: psycopg.Connection = Conn):
+        return history_impl(rtype, rid, conn)
+
+    async def create(request: Request, _w: None = Depends(require_writes), conn: psycopg.Connection = Conn):
+        return await create_impl(rtype, request, conn)
+
+    async def update(request: Request, rid: str = RidParam, _w: None = Depends(require_writes),
+                     conn: psycopg.Connection = Conn):
+        return await update_impl(rtype, rid, request, conn)
+
+    app.add_api_route(path, search, methods=["GET"], **d["search"])
+    app.add_api_route(path, create, methods=["POST"], **d["create"])
+    app.add_api_route(path + "/{rid}", read, methods=["GET"], **d["read"])
+    app.add_api_route(path + "/{rid}", update, methods=["PUT"], **d["update"])
+    app.add_api_route(path + "/{rid}/_history", history, methods=["GET"], **d["history"])
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="polstats", version="0.1.0", description="Open data API for US national politics: members of Congress, terms, and election results")
+    app = FastAPI(title="polstats", version="0.1.0", summary=docs.API_SUMMARY, description=docs.API_DESCRIPTION,
+                  openapi_tags=docs.openapi_tags(),
+                  license_info={"name": "MIT", "url": "https://github.com/charlestirrell/polstats/blob/main/LICENSE"},
+                  contact={"name": "polstats on GitHub", "url": docs.README})
 
     # Static data explorer. Mounted before the /{rtype} routes so "/ui" is never read as a resource type.
     app.mount("/ui", RevalidatedStatic(directory=WEB_DIR, html=True), name="ui")
@@ -112,7 +266,7 @@ def create_app() -> FastAPI:
     async def _missing(_: Request, exc: LookupError):
         return outcome(404, "error", "not-found", str(exc.args[0]) if exc.args else "not found")
 
-    @app.get("/metadata")
+    @app.get("/metadata", **docs.METADATA_DOCS)
     def metadata():
         return {
             "resourceType": "CapabilityStatement",
@@ -126,123 +280,34 @@ def create_app() -> FastAPI:
                 for t in sorted(REGISTRY)]}],
         }
 
-    @app.get("/{rtype}")
+    # Documented per-resource routes first, so they win over the generic fallbacks below.
+    for rtype in docs.TAG_ORDER:
+        if rtype in REGISTRY:
+            _register_resource(app, rtype)
+
+    # Generic fallbacks, hidden from the docs: they answer unknown types with a 404 OperationOutcome
+    # (and would serve any resource type added to REGISTRY but not yet documented).
+    @app.get("/{rtype}", include_in_schema=False)
     def search(rtype: str, request: Request, conn: psycopg.Connection = Depends(get_conn)):
-        cls = _cls(rtype)
-        query = [(k, v) for k, v in request.query_params.multi_items()]
-        where, args = build_where(rtype, query)
+        return search_impl(rtype, request, conn)
 
-        def _int(name: str, default: int, lo: int, hi: int) -> int:
-            raw = request.query_params.get(name)
-            if raw is None:
-                return default
-            try:
-                n = int(raw)
-            except ValueError:
-                raise BadRequest(f"{name} must be an integer")
-            if not lo <= n <= hi:
-                raise BadRequest(f"{name} must be between {lo} and {hi}")
-            return n
-
-        count = _int("_count", DEFAULT_COUNT, 0, MAX_COUNT)
-        offset = _int("_offset", 0, 0, 10**9)
-        total = conn.execute(f"SELECT count(*) FROM {cls.table} r WHERE {where}", args).fetchone()[0]
-        rows = conn.execute(
-            f"SELECT r.resource FROM {cls.table} r WHERE {where} ORDER BY r.last_updated, r.id LIMIT %s OFFSET %s",
-            [*args, count, offset]).fetchall()
-        docs = [r[0] for r in rows]
-
-        entries = [{"fullUrl": f"{rtype}/{d['id']}", "resource": d, "search": {"mode": "match"}} for d in docs]
-
-        # _include=Type:field (repeatable)
-        wanted: dict[str, set[str]] = {}
-        for spec in request.query_params.getlist("_include"):
-            src, _, field = spec.partition(":")
-            if src != rtype or field not in INCLUDES.get(rtype, {}):
-                raise BadRequest(f"unsupported _include {spec!r}; supported: "
-                                 f"{[f'{rtype}:{f}' for f in INCLUDES.get(rtype, {})]}")
-            target_type = INCLUDES[rtype][field]
-            for d in docs:
-                ref = (d.get(field) or {}).get("reference", "")
-                if ref.startswith(target_type + "/") and _valid_id(ref.split("/", 1)[1]):
-                    wanted.setdefault(target_type, set()).add(ref.split("/", 1)[1])
-        for ttype, ids in wanted.items():
-            inc = conn.execute(f"SELECT resource FROM {REGISTRY[ttype].table} WHERE id = ANY(%s::uuid[])",
-                               [sorted(ids)]).fetchall()
-            entries += [{"fullUrl": f"{ttype}/{r[0]['id']}", "resource": r[0], "search": {"mode": "include"}}
-                        for r in inc]
-
-        links = [{"relation": "self", "url": str(request.url)}]
-        if offset + count < total:
-            links.append({"relation": "next",
-                          "url": str(request.url.include_query_params(_offset=offset + count, _count=count))})
-        return {"resourceType": "Bundle", "type": "searchset", "total": total, "link": links, "entry": entries}
-
-    @app.get("/{rtype}/{rid}")
+    @app.get("/{rtype}/{rid}", include_in_schema=False)
     def read(rtype: str, rid: str, conn: psycopg.Connection = Depends(get_conn)):
-        cls = _cls(rtype)
-        row = conn.execute(f"SELECT resource FROM {cls.table} WHERE id = %s::uuid", [rid]).fetchone() \
-            if _valid_id(rid) else None
-        if row is None:
-            raise LookupError(f"{rtype}/{rid} not found")
-        doc = row[0]
-        return JSONResponse(doc, headers={"ETag": _etag(doc), "Last-Modified": doc["meta"]["lastUpdated"]})
+        return read_impl(rtype, rid, conn)
 
-    @app.get("/{rtype}/{rid}/_history")
+    @app.get("/{rtype}/{rid}/_history", include_in_schema=False)
     def history(rtype: str, rid: str, conn: psycopg.Connection = Depends(get_conn)):
-        cls = _cls(rtype)
-        rows = conn.execute(
-            f"SELECT resource FROM {cls.table}_history WHERE id = %s::uuid ORDER BY version_id DESC", [rid]
-        ).fetchall() if _valid_id(rid) else []
-        if not rows:
-            raise LookupError(f"{rtype}/{rid} not found")
-        return {"resourceType": "Bundle", "type": "history", "total": len(rows),
-                "entry": [{"fullUrl": f"{rtype}/{rid}/_history/{r[0]['meta']['versionId']}", "resource": r[0]}
-                          for r in rows]}
+        return history_impl(rtype, rid, conn)
 
-    def _parse(cls, rtype: str, body: dict):
-        if not isinstance(body, dict) or body.get("resourceType") != rtype:
-            raise BadRequest(f"body must be a JSON object with resourceType {rtype!r}")
-        try:
-            return cls.model_validate(body)
-        except ValidationError as e:
-            raise BadRequest("; ".join(f"{'.'.join(map(str, x['loc']))}: {x['msg']}" for x in e.errors()))
-
-    @app.post("/{rtype}", status_code=201)
+    @app.post("/{rtype}", status_code=201, include_in_schema=False)
     async def create(rtype: str, request: Request, _w: None = Depends(require_writes),
                      conn: psycopg.Connection = Depends(get_conn)):
-        cls = _cls(rtype)
-        try:
-            body = await request.json()
-        except ValueError:
-            raise BadRequest("body is not valid JSON")
-        res = _parse(cls, rtype, {k: v for k, v in body.items() if k not in ("id", "meta")} if isinstance(body, dict) else body)
-        saved = Store(conn).create(res)
-        doc = saved.model_dump(mode="json", exclude_none=True)
-        return JSONResponse(doc, status_code=201,
-                            headers={"Location": f"/{rtype}/{saved.id}/_history/1", "ETag": _etag(doc)})
+        return await create_impl(rtype, request, conn)
 
-    @app.put("/{rtype}/{rid}")
+    @app.put("/{rtype}/{rid}", include_in_schema=False)
     async def update(rtype: str, rid: str, request: Request, _w: None = Depends(require_writes),
                      conn: psycopg.Connection = Depends(get_conn)):
-        cls = _cls(rtype)
-        try:
-            body = await request.json()
-        except ValueError:
-            raise BadRequest("body is not valid JSON")
-        res = _parse(cls, rtype, body)
-        if res.id != rid:
-            raise BadRequest("body id must match URL id")
-        row = conn.execute(f"SELECT resource FROM {cls.table} WHERE id = %s::uuid", [rid]).fetchone() \
-            if _valid_id(rid) else None
-        if row is None:
-            raise LookupError(f"{rtype}/{rid} not found (PUT does not create)")
-        if_match = request.headers.get("If-Match")
-        if if_match and if_match != _etag(row[0]):
-            return outcome(412, "error", "conflict", f"version mismatch; current is {_etag(row[0])}")
-        saved = Store(conn).update(res)
-        doc = saved.model_dump(mode="json", exclude_none=True)
-        return JSONResponse(doc, headers={"ETag": _etag(doc)})
+        return await update_impl(rtype, rid, request, conn)
 
     return app
 

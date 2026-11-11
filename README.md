@@ -121,6 +121,12 @@ Ten resource types, stored as versioned JSON documents. Full detail in [docs/DES
 
 ## API
 
+**Interactive reference:** with the server running, <http://localhost:8000/docs> (Swagger UI) and
+<http://localhost:8000/redoc> document every resource as its own section: all five operations (search, read, history,
+create, update), every search parameter with its allowed values, `_include` options, a worked example response, and the
+full field-by-field schema. The machine-readable OpenAPI document is at `/openapi.json`. A test keeps it in sync with
+the code, so a new search parameter can't ship undocumented.
+
 Search with typed parameters; unknown parameters are rejected with a 400 rather than silently ignored.
 
 ```text
@@ -211,7 +217,7 @@ src/polstats/
   store.py                PostgreSQL JSONB store: versioning, history, upsert
   fetch.py                reproducible, checksum-verified downloads
   loaders/                one idempotent loader per source
-  api/                    FastAPI app and search-parameter definitions
+  api/                    FastAPI app, search parameters, OpenAPI docs (docs.py)
   web/                    the explorer UI (static files: app.js, filters.js, style.css)
 tests/                    pytest suite (including repo-hygiene guards)
 docs/                     design notes and screenshots
