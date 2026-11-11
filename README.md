@@ -1,5 +1,7 @@
 # polstats
 
+[![CI](https://github.com/charlestirrell/polstats/actions/workflows/ci.yml/badge.svg)](https://github.com/charlestirrell/polstats/actions/workflows/ci.yml)
+
 **An open-source data store, REST API and explorer for US national politics**: who sits in Congress, from which
 state and district, in which party and when, and how they got there. Built on Python, PostgreSQL and public data.
 
