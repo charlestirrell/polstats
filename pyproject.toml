@@ -1,0 +1,42 @@
+[project]
+name = "polstats"
+version = "0.1.0"
+description = "Open data store, REST API and explorer for US national politics: Congress members, terms, and election results"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["politics", "congress", "elections", "open-data", "fastapi", "postgresql"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.7",
+    "psycopg[binary]>=3.2",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/polstats"]
+
+[tool.uv]
+# Run from source: set PYTHONPATH=src (see README). Deliberately not installed as a package, which also avoids
+# editable-install .pth files that some macOS setups hide from Python.
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = ["db: requires a running Postgres (docker compose up -d)"]

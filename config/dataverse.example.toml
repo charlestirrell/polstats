@@ -1,0 +1,11 @@
+# Harvard Dataverse "guestbook" response, required to download some files (e.g. the MEDSL House file).
+#
+# Copy this file to  config/dataverse.local.toml  and fill it in. The .local.toml file is git-ignored and is
+# only ever sent to dataverse.harvard.edu by `python -m polstats.fetch` when the server asks for it.
+# Never commit the filled-in copy.
+
+[guestbook]
+name = "YOUR_NAME"
+email = "YOUR_EMAIL"
+institution = "YOUR_ORGANISATION"   # use "Independent" or "None" if you have none
+position = "YOUR_ROLE"              # e.g. "Researcher", "Student", "Other"

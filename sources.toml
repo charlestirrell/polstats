@@ -1,0 +1,62 @@
+# Data sources fetched by:  PYTHONPATH=src uv run python -P -m polstats.fetch
+# Raw files land in raw/<source>/ and are git-ignored: this manifest, not the data, is what we version.
+#
+# Dataverse files are pinned by file id (a new dataset version gets new ids) and verified against the
+# MD5 that Dataverse publishes for the ORIGINAL uploaded file (`original = true` => ?format=original).
+# Mutable sources (updated upstream) have no checksum; the loaders record a content hash as Provenance.
+
+[[source]]
+name = "congress-legislators"
+description = "Members of Congress 1789-present (current file): names, terms, party, cross-reference IDs"
+homepage = "https://github.com/unitedstates/congress-legislators"
+license = "CC0-1.0 (as reported by the project; verify)"
+mutable = true
+
+  [[source.file]]
+  url = "https://unitedstates.github.io/congress-legislators/legislators-current.json"
+  dest = "legislators-current.json"
+
+[[source]]
+name = "medsl-senate"
+description = "MIT Election Data + Science Lab: U.S. Senate statewide returns 1976-2024"
+doi = "10.7910/DVN/PEJ5QU"
+dataset_version = "8.0"
+license = "CC0-1.0"
+
+  [[source.file]]
+  dataverse_id = 13887039
+  dest = "1976-2024-senate-state.csv"
+  original = true
+  md5 = "0f8b51cf0f77a2ef0bff992f7a64d1b4"
+
+  [[source.file]]
+  dataverse_id = 6708560
+  dest = "codebook-us-senate-1976-2024.md"
+  md5 = "1cab4bc42b0ca632223b9b9a90c65f30"
+
+  [[source.file]]
+  dataverse_id = 4304792
+  dest = "sources-senate.csv"
+  original = true
+  md5 = "d92c44441367c4acda59e8779dc62155"
+
+[[source]]
+name = "medsl-house"
+description = "MIT Election Data + Science Lab: U.S. House district returns 1976-2024"
+doi = "10.7910/DVN/IG0UN2"
+dataset_version = "15.0"
+license = "CC0-1.0"
+# Dataverse serves these files only after a "guestbook" response (name, email, affiliation).
+# Put yours in config/dataverse.local.toml (git-ignored); see config/dataverse.example.toml.
+requires_guestbook = true
+
+  [[source.file]]
+  dataverse_id = 13592823
+  dest = "1976-2024-house.tsv"
+  original = true
+  md5 = "a9566ac393913a1af343284e837c17bb"
+
+  [[source.file]]
+  dataverse_id = 12066703
+  dest = "codebook-us-house-1976-2024.md"
+  md5 = "4ca4082f75b976b7245c00126615cd2f"

@@ -1,0 +1,15 @@
+# environment / tooling
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+
+# DATA: never commit. Raw downloads are reproduced from sources.toml with `python -m polstats.fetch`.
+raw/
+*.tab
+*.tsv
+
+# local secrets / personal details (templates are committed as *.example.toml)
+config/*.local.toml
+*.local.toml
