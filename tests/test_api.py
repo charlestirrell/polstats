@@ -142,12 +142,18 @@ def test_election_resources_search(client, tmp_path):
     assert any(e["resource"]["resourceType"] == "Contest" for e in cand["entry"])
     assert client.get("/Candidacy", params={"name": "jane roe", "party": "D"}).json()["total"] >= 1
 
+    prov = client.get("/Provenance", params={"source": "MIT Election Data and Science Lab", "_count": 1}).json()
+    assert prov["total"] >= 1 and prov["entry"][0]["resource"]["license"] == "CC0-1.0"
+    assert client.get("/Provenance", params={"source": "no such source", "_count": 1}).json()["total"] == 0
+
 
 def test_ui_is_served_and_does_not_shadow_resources(client):
     r = client.get("/ui/")
-    assert r.status_code == 200 and "polstats data explorer" in r.text
+    assert r.status_code == 200 and "Elections Explorer" in r.text
     assert client.get("/ui/app.js").status_code == 200
     assert client.get("/ui/filters.js").status_code == 200 and client.get("/ui/style.css").status_code == 200
+    for path in ("/ui/", "/ui/app.js", "/ui/filters.js", "/ui/style.css"):   # never serve a half-stale UI after an upgrade
+        assert client.get(path).headers["cache-control"] == "no-cache", path
     assert client.get("/", follow_redirects=False).headers["location"] == "/ui/"
     assert client.get("/Person?_count=0").json()["resourceType"] == "Bundle"
 

@@ -3,23 +3,27 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>polstats data explorer</title>
+<title>US Congress &amp; Elections Explorer · polstats</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <header class="top">
   <div class="top-inner">
     <div>
-      <h1>polstats data explorer</h1>
-      <p class="sub">Verification view over the polstats API. Every number here is fetched from this server's REST endpoints.</p>
+      <h1>US Congress &amp; Elections Explorer</h1>
+      <p class="sub">Who serves in Congress today, and how seats have been won since 1976. Open data; every figure is served by the polstats API.</p>
     </div>
     <div class="top-actions">
+      <a class="btn-link" href="#data-notes" id="notes-link">Data notes</a>
       <button type="button" id="theme" aria-label="Switch colour theme">Theme: auto</button>
       <a class="btn-link" href="/docs">API docs</a>
     </div>
   </div>
 </header>
-<nav id="filterbar" class="filterbar" aria-label="Filters"></nav>
+<div class="sticky">
+  <nav id="tabs" class="tabs" role="tablist" aria-label="Choose a view"></nav>
+  <nav id="filterbar" class="filterbar" aria-label="Filters"></nav>
+</div>
 <div id="banner" class="banner" role="alert" hidden></div>
 <main id="main" aria-live="polite"><p class="loading">Loading…</p></main>
 

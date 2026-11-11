@@ -46,9 +46,12 @@ Tests that need Postgres use a separate `polstats_test` database and skip if the
 - Views must respect the global filters: members go through `memberMatches` and contests through `contestMatches`
   (`filters.js`), and charts should handle "nothing matches" with an empty state. Filter state lives in the URL hash
   (`filtersToHash` / `filtersFromHash`), which is untrusted input: validate everything you read from it.
-- The UI has no automated test suite yet. When you change it, exercise it in a browser (including a zero-result query
-  and a phone-width window) and compare filtered counts with the API, for example
-  `OfficeTerm?state=TX&chamber=house&party=R&active-on=...` against the same filters in the UI.
+- The UI has no JavaScript test runner, but it has an in-page smoke test: [tests/ui/smoke.js](tests/ui/smoke.js) drives
+  the real controls and cross-checks counts with the API (see [tests/ui/README.md](tests/ui/README.md)). Run it after any UI
+  change, add a check for what you add, and also try a zero-result query and a phone-width window by hand.
+- Keep the two views separate. Anything that belongs to *current members* goes in "Congress now" and anything about *past
+  elections* in "Election history"; say in the card text which one a number comes from, and never mix the two datasets in one
+  count. Wording matters to analysts: prefer plain terms ("Election type", "Vote share") over internal ones.
 
 ## Pull requests
 

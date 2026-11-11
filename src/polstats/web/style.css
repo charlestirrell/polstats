@@ -30,6 +30,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }   /* component display rules must never override the hidden attribute */
 html { background: var(--page); }
 body { margin: 0; background: var(--page); color: var(--ink);
   font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
@@ -152,8 +153,9 @@ a { color: var(--c-D); }
 
 /* ---------- live filter bar ---------- */
 .top-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.filterbar { background: var(--page); border-bottom: 1px solid var(--grid); padding: 8px 16px 8px; z-index: 6; }
-@media (min-width: 900px) { .filterbar { position: sticky; top: 0; } }
+.sticky { background: var(--page); }
+.filterbar { background: var(--page); border-bottom: 1px solid var(--grid); padding: 8px 16px 8px; }
+@media (min-width: 900px) { .sticky { position: sticky; top: 0; z-index: 6; } }
 .filterbar > * { max-width: 1280px; margin-left: auto; margin-right: auto; }
 .fb-row { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
 .fb-row + .fb-row { margin-top: 6px; }
@@ -217,3 +219,54 @@ a { color: var(--c-D); }
 .checks-details > summary h2 { margin: 0; }
 .checks-details > summary:focus-visible { outline: 2px solid var(--c-D); outline-offset: 4px; border-radius: 6px; }
 .checks-body { margin-top: 10px; }
+
+
+/* ---------- two views: Congress now / Election history ---------- */
+.tabs { display: flex; gap: 4px; padding: 8px 16px 0; max-width: 1312px; margin: 0 auto; border-bottom: 1px solid var(--grid); }
+.tab { all: unset; box-sizing: border-box; cursor: pointer; padding: 8px 16px 10px; border-radius: 8px 8px 0 0; border: 1px solid transparent;
+  border-bottom: 0; display: grid; gap: 1px; margin-bottom: -1px; color: var(--ink2); }
+.tab:hover { background: var(--wash); }
+.tab:focus-visible { outline: 2px solid var(--c-D); outline-offset: -2px; }
+.tab[aria-selected="true"] { background: var(--surface); border-color: var(--grid); color: var(--ink); box-shadow: inset 0 3px 0 var(--ink); }
+.tab-title { font-weight: 650; font-size: 15px; }
+.tab-sub { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+.view-head { display: grid; gap: 6px; }
+.view-title { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
+.view-title h2 { font-size: 20px; margin: 0; }
+.pill { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 650; letter-spacing: .02em; }
+.pill-now { background: var(--ink); color: var(--page); }
+.pill-hist { border: 1.5px dashed var(--ink2); color: var(--ink2); }
+.coverage { color: var(--ink2); font-size: 13px; margin: 0; max-width: 100ch; }
+.coverage a { color: var(--ink2); }
+.coverage strong { color: var(--ink); }
+
+/* hold-overs, vacancies, majority */
+.badge { display: inline-block; margin-left: 6px; padding: 0 6px; border: 1px solid var(--axis); border-radius: 4px; font-size: 11px; color: var(--ink2); white-space: nowrap; }
+.seg-part.vacant { background: repeating-linear-gradient(135deg, var(--axis) 0 4px, transparent 4px 8px); color: var(--ink); border: 1px dashed var(--muted); }
+.seg-wrap { position: relative; }
+.majority { position: absolute; left: 50%; top: -4px; bottom: -4px; border-left: 2px solid var(--ink); pointer-events: none; }
+.majority span { position: absolute; top: -16px; left: 4px; font-size: 11px; color: var(--ink2); white-space: nowrap; }
+.note-line { color: var(--ink2); font-size: 12px; margin: 6px 0 0; }
+.toggle-line { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin-bottom: 8px; }
+
+/* a seat: current holder plus its recent results */
+.seat-card h2 { font-size: 16px; }
+.seat-holders { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 8px 0; }
+.seat-holder { display: flex; gap: 8px; align-items: baseline; }
+.link-btn { all: unset; cursor: pointer; color: var(--c-D); text-decoration: underline; text-underline-offset: 2px; }
+.link-btn:focus-visible { outline: 2px solid var(--c-D); }
+.seat-panel select { width: 100%; }
+
+/* Data notes footer */
+.notes-card summary h2 { margin: 0; }
+
+.section-label { font-size: 12px; font-weight: 650; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 10px 0 -6px; }
+.cov-list { margin: 6px 0 14px; padding-left: 18px; display: grid; gap: 6px; font-size: 13px; color: var(--ink2); }
+.cov-list strong { color: var(--ink); }
+.checks-body h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 14px 0 6px; }
+.bridges { margin: 0; color: var(--ink2); }
+
+.seg-part[data-g="R"] { justify-content: flex-end; }   /* keeps the Republican count clear of the majority marker */
+.seat-card .section-label { margin: 14px 0 6px; }
+.seat-card .card-head { margin-bottom: 2px; }

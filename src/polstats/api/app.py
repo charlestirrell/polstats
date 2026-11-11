@@ -56,6 +56,16 @@ def require_writes() -> None:
                              "(there is no authentication, so only do this on a machine you control)")
 
 
+class RevalidatedStatic(StaticFiles):
+    """Static files the browser must revalidate on every load (ETag makes that a cheap 304), so an upgraded UI is
+    never served half-stale (new app.js running against an old, cached filters.js)."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 def get_conn() -> Iterator[psycopg.Connection]:
     with psycopg.connect(dsn()) as conn:
         yield conn
@@ -84,7 +94,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title="polstats", version="0.1.0", description="Open data API for US national politics: members of Congress, terms, and election results")
 
     # Static data explorer. Mounted before the /{rtype} routes so "/ui" is never read as a resource type.
-    app.mount("/ui", StaticFiles(directory=WEB_DIR, html=True), name="ui")
+    app.mount("/ui", RevalidatedStatic(directory=WEB_DIR, html=True), name="ui")
 
     @app.get("/", include_in_schema=False)
     def root():

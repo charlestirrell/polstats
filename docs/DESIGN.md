@@ -83,7 +83,7 @@ ideology scores.
 - **Fetching.** `sources.toml` is the manifest; `fetch.py` downloads from an allow-list of hosts, verifies checksums
   and writes atomically. Raw data lives in `raw/` and is never committed.
 - **UI.** Static files that use only the REST API. Charts are hand-built SVG so colours, marks and accessibility
-  are fully controlled; a Data checks panel surfaces quality problems.
+  are fully controlled; a collapsed notes section surfaces sources, coverage and quality checks.
 - **Tests.** pytest, with DB tests against a separate database and hygiene tests that guard the repository.
 
 ## 5. Data sources
@@ -127,6 +127,14 @@ Services that have shut down and should not be depended on: the ProPublica Congr
   runoff; the first round's top candidates who appear in the runoff are `advanced-to-runoff`.
 - **Source inconsistencies.** If candidate votes (net of non-vote ballots) differ from the source's total, the loader
   reports the contest instead of adjusting any number.
+
+- **Held-over members (explorer only).** If a person the source still lists as serving has no term in force on the selected
+  date, but their latest term ended within the previous 120 days, the explorer treats them as holding the seat until a
+  successor is seated and flags them "held over" (their party comes from their latest affiliation). This corrects the
+  common case of an appointee whose scheduled term ends on the special-election date. It is a presentation rule, not stored
+  data: `OfficeTerm` periods and the API's `active-on` search are unchanged.
+- **Caucus.** The `caucus` extension on a term records which party an independent caucuses with; the explorer can count by
+  caucus as well as by party.
 
 ## 7. Decisions
 

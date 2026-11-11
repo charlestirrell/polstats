@@ -189,7 +189,7 @@ PARAMS: dict[str, dict[str, Builder]] = {
     "PartyAffiliation": {
         "person": ref_eq("person", "Person"), "party": affil_party, "active-on": active_on,
     },
-    "Provenance": {"target": target},
+    "Provenance": {"target": target, "source": text_eq("source")},
     "Election": {"year": int_eq("year"), "kind": code_in("kind")},
     "Contest": {
         "election": ref_eq("election", "Election"), "year": contest_year,

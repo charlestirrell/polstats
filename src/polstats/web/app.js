@@ -19,8 +19,9 @@ const S = {
   allTerms: [], termsByPerson: new Map(), counts: {},
   asOf: null, active: [], affils: [], rows: [],
   view: {}, sort: { k: 'name', dir: 1 }, csort: { k: 'year', dir: -1 }, cLimit: 200, mLimit: 150, fsums: [], checksCache: null, checksOpen: false,
-  elec: null, elecYear: null, elecChamber: 'senate', elecError: null,
+  elec: null, elecError: null, tab: 'now', compBy: 'party', allAffils: new Map(), prov: {},
 };
+const HOLDOVER_DAYS = 120;   // a scheduled term end this recent, for someone the source still lists as serving, is a hold-over
 
 /* ---------- tiny DOM helpers ---------- */
 function el(tag, props = {}, ...kids) {
@@ -80,6 +81,16 @@ async function loadStatic() {
     if (!S.termsByPerson.has(k)) S.termsByPerson.set(k, []);
     S.termsByPerson.get(k).push(t);
   }
+  // Every affiliation (about 1,000), so a held-over member's party is known after their term end date has passed.
+  S.allAffils = new Map();
+  for (const a of await fetchAll('/PartyAffiliation')) {
+    const k = refId(a.person.reference);
+    if (!S.allAffils.has(k)) S.allAffils.set(k, []);
+    S.allAffils.get(k).push(a);
+  }
+  // Where the data came from, as recorded by the loaders (one sample record per source).
+  const prov = async src => { try { const b = await api(`/Provenance?source=${encodeURIComponent(src)}&_count=1`); return b.entry && b.entry[0] ? { ...b.entry[0].resource, total: b.total } : null; } catch (_) { return null; } };
+  S.prov = { members: await prov('unitedstates/congress-legislators'), elections: await prov('MIT Election Data and Science Lab') };
   const types = ['Person', 'Organization', 'Location', 'OfficeTerm', 'PartyAffiliation', 'Provenance',
     'Election', 'Contest', 'Candidacy', 'ContestResult'];
   const totals = await Promise.all(types.map(t => api(`/${t}?_count=0`)));
@@ -114,37 +125,58 @@ function groupOf(partyCode) {
   if (!partyCode) return 'U';
   return partyCode === 'D' || partyCode === 'R' ? partyCode : 'I';
 }
+const CAUCUS_GROUP = name => (/democrat/i.test(name) ? 'D' : /republican/i.test(name) ? 'R' : 'I');
+const daysBetween = (fromIso, to) => (to - new Date(fromIso + 'T00:00:00Z')) / 864e5;
 function derive() {
   const asOf = new Date(S.asOf + 'T00:00:00Z');
+  const orgParty = ref => { const org = S.orgs.get(refId(ref.reference)); return { code: org ? identVal(org, SYS_PARTY) : null, name: org ? org.name : '?' }; };
   const partyByPerson = new Map();
   for (const a of S.affils) {
     const k = refId(a.person.reference);
     if (!partyByPerson.has(k)) partyByPerson.set(k, []);
-    const org = S.orgs.get(refId(a.party.reference));
-    partyByPerson.get(k).push({ code: org ? identVal(org, SYS_PARTY) : null, name: org ? org.name : '?' });
+    partyByPerson.get(k).push(orgParty(a.party));
   }
-  S.rows = S.active.map(t => {
+  // Hold-overs: the source still lists these people as serving, but the scheduled end of their term has just passed
+  // (typically an appointee whose term ends on the special-election date). They hold the seat until a successor is
+  // seated, so they are shown as serving, flagged, rather than silently dropped from the chamber.
+  const activePids = new Set(S.active.map(t => refId(t.person.reference)));
+  const held = [];
+  for (const [pid, terms] of S.termsByPerson) {
+    if (activePids.has(pid)) continue;
+    const last = terms.filter(t => t.period.end).sort((x, y) => x.period.end.localeCompare(y.period.end)).pop();
+    if (!last || terms.some(t => t.period.start > S.asOf)) continue;
+    const gap = daysBetween(last.period.end, asOf);
+    if (gap >= 0 && gap <= HOLDOVER_DAYS) held.push(last);
+  }
+  const latestAffil = pid => {
+    const list = (S.allAffils.get(pid) || []).slice().sort((x, y) => (x.period.end || '9999').localeCompare(y.period.end || '9999'));
+    return list.length ? [orgParty(list[list.length - 1].party)] : [];
+  };
+  const build = (t, holdover) => {
     const pid = refId(t.person.reference);
     const p = S.persons.get(pid) || { name: [{ text: '(missing person)' }], identifier: [] };
     const state = S.locs.get(refId(t.state.reference));
     const district = t.district ? S.locs.get(refId(t.district.reference)) : null;
-    const parties = partyByPerson.get(pid) || [];
+    const parties = holdover ? latestAffil(pid) : (partyByPerson.get(pid) || []);
     const first = (S.termsByPerson.get(pid) || []).map(x => x.period.start).filter(Boolean).sort()[0];
     const birth = p.birthDate ? new Date(p.birthDate + 'T00:00:00Z') : null;
     const name = (p.name && (p.name[0].text || [p.name[0].given, p.name[0].family].flat().join(' '))) || pid;
+    const caucusExt = (t.extension || []).find(e => e.url === 'urn:polstats:caucus');
+    const group = groupOf(parties[0] && parties[0].code);
     return {
-      pid, term: t, person: p, name,
+      pid, term: t, person: p, name, holdover: !!holdover,
       chamber: code(t.chamber), office: code(t.office),
       state: state ? identVal(state, SYS_USPS) || state.name : '?', stateName: state ? state.name : '?',
       district: district ? district.name : (t.senateClass ? `Class ${t.senateClass}` : ''),
       partyCode: parties[0] ? parties[0].code : null, partyName: parties[0] ? parties[0].name : '',
-      partyCount: parties.length,
-      group: groupOf(parties[0] && parties[0].code),
+      partyCount: holdover ? 1 : parties.length,
+      group, caucus: caucusExt ? caucusExt.value : '', caucusGroup: caucusExt ? CAUCUS_GROUP(caucusExt.value) : group,
       birth: p.birthDate || '', age: birth ? Math.floor((asOf - birth) / YEAR) : null,
       firstStart: first || '', tenure: first ? (asOf - new Date(first + 'T00:00:00Z')) / YEAR : null,
       bioguide: identVal(p, SYS_BIOGUIDE) || '',
     };
-  });
+  };
+  S.rows = [...S.active.map(t => build(t, false)), ...held.map(t => build(t, true))];
 }
 const median = a => {
   const s = a.filter(x => x != null).sort((x, y) => x - y);
@@ -280,22 +312,30 @@ function stackedBars(host, cats, groups, ariaLabel, onPick) {
 
 /* tall segmented bar (one whole split into <= 4 parts) */
 function segmentedBar(title, counts, groups, opts = {}) {
-  const total = groups.reduce((s, g) => s + (counts[g.key] || 0), 0);
+  const sum = groups.reduce((s, g) => s + (counts[g.key] || 0), 0);
+  const size = opts.size || sum, vacant = Math.max(0, size - sum);   // size: the full chamber, so vacancies can be shown
   const present = groups.filter(g => counts[g.key] > 0);
-  const label = `${title}: ${present.map(g => `${g.name} ${counts[g.key]}`).join(', ')}`;
+  const pctOf = n => Math.round((n / (size || 1)) * 100);
+  const label = `${title}: ${present.map(g => `${g.name} ${counts[g.key]}`).join(', ')}${vacant ? `, ${vacant} vacant` : ''}`;
   const bar = el('div', { class: 'seg', role: 'img', 'aria-label': label });
   for (const g of present) {
-    const pct = Math.round((counts[g.key] / total) * 100);
-    const part = el('div', { class: 'seg-part', tabindex: 0, style: `flex:${counts[g.key]} 1 0;background:var(--c-${g.key})`, 'aria-label': `${g.name}: ${counts[g.key]} (${pct}%)` });
-    part.dataset.label = String(counts[g.key]);
-    bindTip(part, part, title, [{ key: g.key, name: `${g.name} (${pct}%)`, value: counts[g.key] }]);
+    const part = el('div', { class: 'seg-part', tabindex: 0, style: `flex:${counts[g.key]} 1 0;background:var(--c-${g.key})`, 'aria-label': `${g.name}: ${counts[g.key]} (${pctOf(counts[g.key])}%)` });
+    part.dataset.label = String(counts[g.key]); part.dataset.g = g.key;
+    bindTip(part, part, title, [{ key: g.key, name: `${g.name} (${pctOf(counts[g.key])}%)`, value: counts[g.key] }]);
     if (opts.onPart) makePickable(part, () => opts.onPart(g));
     bar.append(part);
   }
+  if (vacant) {
+    const v = el('div', { class: 'seg-part vacant', tabindex: 0, style: `flex:${vacant} 1 0`, 'aria-label': `Vacant: ${vacant} (${pctOf(vacant)}%)` });
+    v.dataset.label = String(vacant);
+    bindTip(v, v, title, [{ key: 'U', name: `Vacant seats (${pctOf(vacant)}%)`, value: vacant }]);
+    bar.append(v);
+  }
   const head = el('div', { class: 'seg-row-head' },
     opts.onTitle ? el('button', { type: 'button', text: title, title: 'Filter to this chamber', onclick: opts.onTitle }) : el('span', { text: title }),
-    el('span', { text: `${total} total` }));
-  const node = el('div', { class: 'seg-row' }, head, bar);
+    el('span', { text: vacant ? `${sum} of ${size} seats filled` : `${sum} seats` }));
+  const wrap = el('div', { class: 'seg-wrap' }, bar, opts.majority ? el('div', { class: 'majority' }, el('span', { text: `Majority: ${opts.majority}` })) : null);
+  const node = el('div', { class: 'seg-row' }, head, wrap);
   node._afterAttach = () => { for (const p of bar.children) if (p.offsetWidth >= 40) p.textContent = p.dataset.label; };
   return node;
 }
@@ -328,7 +368,14 @@ function card(id, title, sub, legendEl, draw, table, scope) {
 }
 
 /* ---------- sections ---------- */
-const memberScope = rows => (memberFiltersActive() ? `Filtered: ${fmt(rows.length)} of ${fmt(S.rows.length)} members.` : null);
+const fmtDate = iso => new Date(iso + 'T00:00:00Z').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
+const ord = n => n + ((n % 100 >= 11 && n % 100 <= 13) ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] || 'th'));
+function congressOf(iso) {   // a Congress runs from 3 January of an odd year for two years
+  const d = new Date(iso + 'T00:00:00Z'); let y = d.getUTCFullYear();
+  if (y % 2 === 1 && d.getUTCMonth() === 0 && d.getUTCDate() < 3) y -= 1;
+  return { n: Math.floor((y - 1789) / 2) + 1, start: y % 2 === 0 ? y - 1 : y };
+}
+const memberScope = rows => (memberFiltersActive() ? `Filtered: ${fmt(rows.length)} of ${fmt(S.rows.length)} current members.` : null);
 const contestScope = () => (contestFiltersActive() && S.elec ? `Filtered: ${fmt(S.fsums.length)} of ${fmt(contestSummaries().length)} contests.` : null);
 const setChamber = ch => { F.chambers = F.chambers.size === 1 && F.chambers.has(ch) ? new Set() : new Set([ch]); filterChanged(); };
 const groupsIn = rows => GROUPS.filter(g => g.key !== 'U' || rows.some(r => r.group === 'U'));
@@ -348,36 +395,55 @@ const histogram = (rows, value, lo, step, hiLabelFrom, count) => {
 const catTable = (cats, groups, first) => tableEl(
   [{ h: first }, ...groups.map(g => ({ h: g.name, num: 1 })), { h: 'Total', num: 1 }],
   cats.map(c => [c.label, ...groups.map(g => c.vals[g.key] || 0), groups.reduce((s, g) => s + (c.vals[g.key] || 0), 0)]));
+const tileEl = (label, value, sub) => el('div', { class: 'tile' }, el('div', { class: 'tile-label', text: label }),
+  el('div', { class: 'tile-value', text: value }), sub ? el('div', { class: 'tile-sub', text: sub }) : null);
+const sectionLabel = text => el('h3', { class: 'section-label', text });
+const gridOf = (...nodes) => el('div', { class: 'grid' }, ...nodes);
 
 function tilesSection(rows) {
-  const filtered = memberFiltersActive(), all = S.rows;
+  const filtered = memberFiltersActive(), all = S.rows, today = S.asOf === todayISO();
   const sen = rows.filter(r => r.chamber === 'senate'), rep = rows.filter(r => r.office === 'representative');
   const nonvoting = rows.filter(r => r.chamber === 'house' && r.office !== 'representative');
-  const tile = (label, value, sub) => el('div', { class: 'tile' }, el('div', { class: 'tile-label', text: label }),
-    el('div', { class: 'tile-value', text: value }), sub ? el('div', { class: 'tile-sub', text: sub }) : null);
+  const heldSen = all.filter(r => r.holdover && r.chamber === 'senate').length;
+  const vacantHouse = Math.max(0, 435 - all.filter(r => r.office === 'representative').length);
   const ma = median(rows.map(r => r.age)), mt = median(rows.map(r => r.tenure));
   return el('div', { class: 'tiles' },
-    tile('Members', fmt(rows.length), filtered ? `of ${fmt(all.length)} · as of ${S.asOf}` : `as of ${S.asOf}`),
-    tile('Senators', fmt(sen.length), filtered ? `of ${fmt(all.filter(r => r.chamber === 'senate').length)} seated` : 'of 100 seats'),
-    tile('House voting members', fmt(rep.length), filtered ? `of ${fmt(all.filter(r => r.office === 'representative').length)} seated` : 'of 435 seats'),
-    tile('Delegates / commissioner', fmt(nonvoting.length), 'non-voting'),
-    tile('Median age', ma == null ? '–' : ma.toFixed(0), 'years'),
-    tile('Median time since first term', mt == null ? '–' : mt.toFixed(1), 'years (first term start)'));
+    tileEl('Current members', fmt(rows.length), filtered ? `of ${fmt(all.length)}` : `as of ${fmtDate(S.asOf)}`),
+    tileEl('Senators', fmt(sen.length), filtered ? `of ${fmt(all.filter(r => r.chamber === 'senate').length)} seated` : `of 100 seats${heldSen ? ` · ${heldSen} held over` : ''}`),
+    tileEl('House voting members', fmt(rep.length), filtered ? `of ${fmt(all.filter(r => r.office === 'representative').length)} seated` : `of 435 seats${today && vacantHouse ? ` · ${vacantHouse} vacant` : ''}`),
+    tileEl('Non-voting delegates', fmt(nonvoting.length), 'DC, territories, Puerto Rico'),
+    tileEl('Median age', ma == null ? '–' : ma.toFixed(0), 'years'),
+    tileEl('Median years since first term began', mt == null ? '–' : mt.toFixed(1), 'earliest recorded term'));
 }
 
 function compositionCard(rows) {
-  const groups = groupsIn(rows);
-  const sen = countBy(rows.filter(r => r.chamber === 'senate'), r => r.group);
-  const rep = countBy(rows.filter(r => r.office === 'representative'), r => r.group);
+  const caucus = S.compBy === 'caucus', keyOf = r => (caucus ? r.caucusGroup : r.group);
+  const filtered = memberFiltersActive(), today = S.asOf === todayISO();
+  const full = !filtered && today;   // vacancies and the majority line only mean something for the whole chamber, today
+  const senRows = rows.filter(r => r.chamber === 'senate'), repRows = rows.filter(r => r.office === 'representative');
+  const sen = countBy(senRows, keyOf), rep = countBy(repRows, keyOf);
+  const gs = GROUPS.filter(g => g.key === 'D' || g.key === 'R' || (sen[g.key] || 0) + (rep[g.key] || 0) > 0);
   const pickParty = g => toggleIn(F.groups, g.key);
-  const sBar = segmentedBar('Senate', sen, groups, { onPart: pickParty, onTitle: () => setChamber('senate') });
-  const hBar = segmentedBar('House (voting members)', rep, groups, { onPart: pickParty, onTitle: () => setChamber('house') });
-  const nodes = [sBar, hBar];
-  const table = tableEl([{ h: 'Chamber' }, ...groups.map(g => ({ h: g.name, num: 1 })), { h: 'Total', num: 1 }],
-    [['Senate', sen], ['House (voting)', rep]].map(([n, c]) => [n, ...groups.map(g => c[g.key] || 0), groups.reduce((s, g) => s + (c[g.key] || 0), 0)]));
-  const c = card('comp', 'Chamber composition', 'Party of each member on the selected date. Click a segment to filter by party, or a chamber name to filter by chamber.', legend(groups),
+  const sBar = segmentedBar('Senate', sen, gs, { size: full ? 100 : 0, majority: full ? 51 : 0, onPart: pickParty, onTitle: () => setChamber('senate') });
+  const hBar = segmentedBar('House (voting members)', rep, gs, { size: full ? 435 : 0, majority: full ? 218 : 0, onPart: pickParty, onTitle: () => setChamber('house') });
+  const notes = [];
+  const held = rows.filter(r => r.holdover);
+  if (held.length) notes.push(`${held.length} held-over Senate seat${held.length > 1 ? 's' : ''}: ${held.map(r => `${r.name} (${r.state})`).join(', ')}. The scheduled term end (${fmtDate(held[0].term.period.end)}, special-election day) has passed, but the source still lists them as serving, and they hold the seat until a successor is seated.`);
+  const vacantHouse = full ? 435 - repRows.length : 0;
+  if (vacantHouse) notes.push(`${vacantHouse} House seat${vacantHouse > 1 ? 's are' : ' is'} vacant.`);
+  const indep = rows.filter(r => r.group === 'I' && r.caucus);
+  if (caucus && indep.length) notes.push(`Counted with their caucus: ${indep.map(r => `${r.name} (${r.state}, caucuses with the ${r.caucus}s)`).join('; ')}.`);
+  if (!caucus && indep.length) notes.push(`${indep.length} independent${indep.length > 1 ? 's' : ''} caucus with a party (${indep.map(r => r.name).join(', ')}). Use “By caucus” to count them with it.`);
+
+  const mk = (key, text) => { const b = el('button', { type: 'button', text, 'aria-pressed': String(S.compBy === key) }); b.onclick = () => { S.compBy = key; render(); }; return b; };
+  const controls = el('div', { class: 'toggle-line' }, el('div', { class: 'seg-toggle', role: 'group', 'aria-label': 'Count by' }, mk('party', 'By party'), mk('caucus', 'By caucus')), legend(gs));
+  const nodes = [sBar, hBar, ...(notes.length ? [el('div', {}, notes.map(n => el('p', { class: 'note-line', text: n })))] : [])];
+  const cell = (c, g) => c[g.key] || 0;
+  const table = tableEl([{ h: 'Chamber' }, ...gs.map(g => ({ h: g.name, num: 1 })), { h: 'Vacant', num: 1 }, { h: 'Seated', num: 1 }],
+    [['Senate', sen, senRows.length, 100], ['House (voting)', rep, repRows.length, 435]]
+      .map(([n, c, tot, size]) => [n, ...gs.map(g => cell(c, g)), full ? size - tot : '', tot]));
+  return card('comp', 'Chamber composition', `Who holds each chamber on ${fmtDate(S.asOf)}${caucus ? ', counting independents with the caucus they join' : ''}. Click a segment to filter by party, or a chamber name to filter by chamber.`, controls,
     host => { host.replaceChildren(...nodes); nodes.forEach(n => n._afterAttach && n._afterAttach()); }, table, memberScope(rows));
-  return c;
 }
 
 function stateCard(rows) {
@@ -389,7 +455,7 @@ function stateCard(rows) {
   const all = [...byState.values()].map(c => ({ ...c, total: groups.reduce((s, g) => s + c.vals[g.key], 0) }))
     .sort((a, b) => b.total - a.total || a.label.localeCompare(b.label));
   const top = all.slice(0, 15);
-  return card('state', 'Delegation size by state', `Top 15 of ${all.length} states and territories by seats held (House + Senate). Click a bar to filter by state. Table view lists all.`,
+  return card('state', 'Seats by state and party', `The 15 largest of ${all.length} delegations (House + Senate). Click a bar to filter by state. Table view lists all.`,
     legend(groups), host => stackedBars(host, top, groups, 'Stacked bars: seats by state and party', c => toggleIn(F.states, c.key)),
     catTable(all, groups, 'State / territory'), memberScope(rows));
 }
@@ -397,7 +463,7 @@ function stateCard(rows) {
 function ageCard(rows) {
   const groups = groupsIn(rows), cats = histogram(rows, r => r.age, 25, 5, null, 14);
   cats.forEach((c, i) => { c.lo = 25 + i * 5; c.hi = i === cats.length - 1 ? Math.max(c.lo, BOUNDS.age[1]) : c.lo + 4; });
-  return card('age', 'Age distribution', 'Members by age on the selected date, 5-year bins, stacked by party. Click a bar to filter by age.', legend(groups),
+  return card('age', 'Age distribution', `Current members by age on ${fmtDate(S.asOf)}, 5-year bins, stacked by party. Click a bar to filter by age.`, legend(groups),
     host => stackedColumns(host, cats, groups, 'Stacked columns: members by age band and party', c => pickRange('age', [c.lo, c.hi])),
     catTable(cats, groups, 'Age'), memberScope(rows));
 }
@@ -478,65 +544,50 @@ function contestSummaries() {
 }
 const chamberOf = c => (c.office === 'senator' ? 'senate' : 'house');
 const CHAMBER_LABEL = { senate: 'Senate', house: 'House' };
+const chambersShown = () => (F.chambers.size ? ['senate', 'house'].filter(c => F.chambers.has(c)) : ['senate', 'house']);
 
-/* Decide which chamber the election charts show, once per render and BEFORE any card reads it. */
-function resolveElecChamber() {
-  const present = ['senate', 'house'].filter(ch => S.fsums.some(c => chamberOf(c) === ch));
-  if (present.length && !present.includes(S.elecChamber)) S.elecChamber = present[0];
-  if (!present.length && F.chambers.size === 1) S.elecChamber = [...F.chambers][0];   // nothing matches: still follow the filter
-  return present;
+/* Which election year the margin charts show: the single year chosen in the bar, else the latest in the selection. */
+function yearsFor(ch) {
+  return [...new Set(S.fsums.filter(c => chamberOf(c) === ch && (c.winner || c.advanced.length)).map(c => c.year))].sort((a, b) => a - b);
 }
-function chamberControl() {
-  const present = ['senate', 'house'].filter(ch => S.fsums.some(c => chamberOf(c) === ch));
-  if (present.length < 2) return null;
-  const sel = el('select', { 'aria-label': 'Chamber', onchange: e => { S.elecChamber = e.target.value; S.elecYear = null; render(); } },
-    present.map(ch => el('option', { value: ch, text: CHAMBER_LABEL[ch] })));
-  sel.value = S.elecChamber;
-  return el('span', { class: 'control' }, el('label', { text: 'Chamber' }), sel);
+function focusYear(ch) {
+  const ys = yearsFor(ch);
+  if (!ys.length) return null;
+  return F.years && F.years[0] === F.years[1] && ys.includes(F.years[0]) ? F.years[0] : ys[ys.length - 1];
 }
 
-function elecYears() {
-  return [...new Set(S.fsums.filter(c => chamberOf(c) === S.elecChamber && (c.winner || c.advanced.length)).map(c => c.year))]
-    .sort((a, b) => a - b);
-}
-
-function seatsWonCard() {
-  const ch = S.elecChamber;
+function seatsWonCard(ch) {
   const sums = S.fsums.filter(c => c.winner && chamberOf(c) === ch && (c.office === 'senator' || c.office === 'representative'));
   const years = [...new Set(sums.map(c => c.year))].sort((a, b) => a - b);
   const groups = GROUPS.filter(g => g.key !== 'U');
   const cats = years.map(y => ({ label: String(y), vals: { D: 0, R: 0, I: 0, U: 0 } }));
   for (const c of sums) cats[years.indexOf(c.year)].vals[groupOf(c.winner.party)]++;
-  const controls = el('div', { class: 'members-controls' }, chamberControl(), legend(groups));
-  return card('seatswon', `${CHAMBER_LABEL[ch]} seats won, by party and election year`,
-    ch === 'house'
-      ? 'Voting seats in regular, special and runoff elections (DC delegate excluded). Winners are derived (plurality; runoff pairs excluded). Click a bar to filter to that year.'
-      : 'Regular, special and runoff elections in the data. Winners are derived (plurality; runoff pairs excluded). Click a bar to filter to that year.',
-    controls, host => stackedColumns(host, cats, groups, `Stacked columns: ${CHAMBER_LABEL[ch]} seats won per election year by party`,
+  return card(`seatswon-${ch}`, `${CHAMBER_LABEL[ch]}: seats won by party, by election year`,
+    `Winners of regular, special and runoff elections${ch === 'house' ? ' (DC delegate excluded)' : ''}. This counts election wins, which is not the same as the chamber's composition (appointments and party switches change that). Winners are computed from votes. Click a bar to filter to that year.`,
+    legend(groups), host => stackedColumns(host, cats, groups, `Stacked columns: ${CHAMBER_LABEL[ch]} seats won per election year by party`,
       c => pickRange('years', [Number(c.label), Number(c.label)])),
     catTable(cats, groups, 'Year'), contestScope());
 }
 
-function marginsCard() {
-  const ch = S.elecChamber, years = elecYears();
-  if (!years.length) return card('margins', 'Election margins', 'No contests with a winner match the current filters.', null, host => host.replaceChildren(emptyNote()), tableEl([{ h: 'Contest' }], []), contestScope());
-  if (!S.elecYear || !years.includes(S.elecYear)) S.elecYear = years[years.length - 1];
-  const sums = S.fsums.filter(c => c.year === S.elecYear && chamberOf(c) === ch)
+function marginsCard(ch) {
+  const years = yearsFor(ch), label = CHAMBER_LABEL[ch];
+  if (!years.length) return card(`margins-${ch}`, `${label}: D−R gap`, 'No contests with a winner match the current filters.', null, host => host.replaceChildren(emptyNote()), tableEl([{ h: 'Contest' }], []), contestScope());
+  const year = focusYear(ch);
+  const sums = S.fsums.filter(c => c.year === year && chamberOf(c) === ch)
     .sort((a, b) => a.stateName.localeCompare(b.stateName) || String(a.district).localeCompare(String(b.district), undefined, { numeric: true }) || a.kind.localeCompare(b.kind));
   const tag = c => (c.kind === 'runoff' ? ' (runoff)' : c.special ? ' (special)' : '') + (ch === 'house' ? ` ${c.district.replace(/^[A-Z]{2}-/, '')}` : '');
   const measured = sums.filter(c => c.margin != null);
-  const select = el('select', { 'aria-label': 'Election year', onchange: e => { S.elecYear = Number(e.target.value); render(); } },
-    years.slice().reverse().map(y => el('option', { value: y, text: String(y), selected: y === S.elecYear ? '' : null })));
+  const multi = years.length > 1;
+  const showing = multi ? `Showing ${year}, the latest year in your selection; use the Election year control above to change it. ` : `Showing ${year}. `;
   const key = el('ul', { class: 'legend', 'aria-label': 'Legend' },
-    el('li', {}, el('span', { class: 'swatch', style: 'background:var(--c-R)' }), 'Republican lead'),
-    el('li', {}, el('span', { class: 'swatch', style: 'background:var(--c-D)' }), 'Democratic lead'));
-  const lg = el('div', { class: 'members-controls' }, chamberControl(), el('span', { class: 'control' }, el('label', { text: 'Election year' }), select), key);
-
+    el('li', {}, el('span', { class: 'swatch', style: 'background:var(--c-R)' }), 'Republican candidate ahead'),
+    el('li', {}, el('span', { class: 'swatch', style: 'background:var(--c-D)' }), 'Democratic candidate ahead'));
+  const gapNote = 'D−R gap = the Democratic candidate\'s vote share minus the Republican\'s, in percentage points. It is not the winner\'s margin, and it ignores races without both.';
   const rows = sums.map(c => [c.stateName + tag(c), c.kind + (c.special && c.kind !== 'special' ? ' (special)' : ''),
     c.winner ? c.winner.name : (c.advanced.length ? 'Runoff: ' + c.advanced.map(a => a.name).join(' / ') : '—'),
     c.winner ? PARTY_NAME[c.winner.party] || c.winner.party : '', c.winner && c.winner.share != null ? pct(c.winner.share) : (c.uncontested ? 'uncontested' : ''),
     c.margin == null ? 'n/a' : signed(c.margin), c.total == null ? '' : fmt(c.total), c.winner && c.winner.cand.person ? 'yes' : '']);
-  const table = tableEl([{ h: 'Contest' }, { h: 'Kind' }, { h: 'Winner' }, { h: 'Party' }, { h: 'Share', num: 1 }, { h: 'Margin D−R (pts)', num: 1 }, { h: 'Total votes', num: 1 }, { h: 'Linked to a person' }], rows);
+  const table = tableEl([{ h: 'Contest' }, { h: 'Election type' }, { h: 'Winner' }, { h: 'Party' }, { h: 'Vote share', num: 1 }, { h: 'D−R gap (pts)', num: 1 }, { h: 'Total votes', num: 1 }, { h: 'Current member?' }], rows);
 
   if (ch === 'senate') {
     const items = measured.sort((a, b) => a.margin - b.margin).map(c => ({
@@ -544,12 +595,11 @@ function marginsCard() {
       aria: `${c.stateName}: ${c.d.name} ${pct(c.d.share)}, ${c.rep.name} ${pct(c.rep.share)}`,
       tip: [{ key: 'D', name: c.d.name, value: pct(c.d.share) }, { key: 'R', name: c.rep.name, value: pct(c.rep.share) }],
     }));
-    return card('margins', `${S.elecYear} contests: two-party vote margin`,
-      'Democratic share minus Republican share, in percentage points (top candidate of each party). Click a bar to filter by state. Table lists every contest incl. winner and uncontested races.',
-      lg, host => items.length ? divergingBars(host, items, `Diverging bars: ${S.elecYear} margins by contest`) : host.replaceChildren(el('p', { class: 'muted', text: 'No contests with both a Democratic and a Republican candidate.' })), table, contestScope());
+    return card(`margins-${ch}`, `${year} ${label} contests: D−R gap`, `${showing}${gapNote} Click a bar to filter by state.`,
+      key, host => items.length ? divergingBars(host, items, `Diverging bars: ${year} ${label} D−R gap by contest`) : host.replaceChildren(el('p', { class: 'muted', text: 'No contests with both a Democratic and a Republican candidate.' })), table, contestScope());
   }
 
-  // House: 435 districts are too many for one bar each, so show how many districts fall in each margin band.
+  // House: 435 districts are too many for one bar each, so show how many districts fall in each gap band.
   const cats = [];
   for (let lo = -100; lo < 100; lo += 10) cats.push({ label: lo >= 0 ? `+${lo}` : `−${-lo}`, lo, vals: { D: 0, R: 0, I: 0, U: 0 } });
   for (const c of measured) {
@@ -557,25 +607,79 @@ function marginsCard() {
     cats[i].vals[c.margin >= 0 ? 'D' : 'R']++;
   }
   const groups = GROUPS.filter(g => g.key === 'D' || g.key === 'R');
-  const unmeasured = sums.length - measured.length;
-  return card('margins', `${S.elecYear} House districts by two-party margin`,
-    `Number of districts in each 10-point band of Democratic minus Republican share (band shown by its lower edge). Click a bar to filter by margin. ${fmt(unmeasured)} contest(s) without both a Democratic and a Republican candidate or without vote counts are only in the table.`,
-    lg, host => stackedColumns(host, cats, groups, `Columns: ${S.elecYear} House districts by margin band`, c => pickRange('margin', [c.lo, c.lo + 10])), table, contestScope());
+  return card(`margins-${ch}`, `${year} ${label} districts: D−R gap`,
+    `${showing}Number of districts in each 10-point band of the D−R gap (band shown by its lower edge). ${gapNote} ${fmt(sums.length - measured.length)} contest(s) are only in the table. Click a bar to filter by gap.`,
+    key, host => stackedColumns(host, cats, groups, `Columns: ${year} ${label} districts by D−R gap band`, c => pickRange('margin', [c.lo, c.lo + 10])), table, contestScope());
 }
 
-function electionsSection() {
-  if (S.elecError) return [el('p', { class: 'scope-note', role: 'alert' }, 'Could not load election results: ' + S.elecError)];
-  if (!S.elec) return [el('section', { class: 'card' }, el('h2', { text: 'Election results' }), el('p', { class: 'card-sub', text: 'Loading election results…' }))];
-  if (!S.elec.contests.size) return [el('section', { class: 'card' }, el('h2', { text: 'Election results' }),
-    el('p', { class: 'card-sub', text: 'No election data loaded yet. Run the MEDSL loader (see README).' }))];
-  resolveElecChamber();
-  return [seatsWonCard(), marginsCard()];
+/* ---------- bridges between people, contests and seats ---------- */
+let _wins = null, _winsFor = null;
+function winsByPerson() {   // person id -> the contests they won (newest first)
+  if (!S.elec) return new Map();
+  if (_winsFor !== S.elec) {
+    const m = new Map();
+    for (const c of contestSummaries()) {
+      if (!c.winner || !c.winner.cand.person) continue;
+      const pid = refId(c.winner.cand.person.reference);
+      if (!m.has(pid)) m.set(pid, []);
+      m.get(pid).push(c);
+    }
+    m.forEach(list => list.sort((x, y) => y.year - x.year));
+    _wins = m; _winsFor = S.elec;
+  }
+  return _wins;
+}
+function rowForPid(pid) {   // a current-member row if there is one, else a minimal row built from the person's latest term
+  const cur = S.rows.find(r => r.pid === pid);
+  if (cur) return cur;
+  const p = S.persons.get(pid);
+  if (!p) return null;
+  const t = (S.termsByPerson.get(pid) || []).slice().sort((x, y) => (x.period.start || '').localeCompare(y.period.start || '')).pop();
+  const st = t && S.locs.get(refId(t.state.reference)), d = t && t.district ? S.locs.get(refId(t.district.reference)) : null;
+  return { pid, person: p, name: (p.name && p.name[0].text) || pid, term: t, group: 'U', partyName: '', chamber: t ? code(t.chamber) : '',
+    state: st ? identVal(st, SYS_USPS) || '' : '', stateName: st ? st.name : '', district: d ? d.name : (t && t.senateClass ? `Class ${t.senateClass}` : ''),
+    birth: p.birthDate || '', bioguide: identVal(p, SYS_BIOGUIDE) || '' };
+}
+const seatCodeOfRow = r => (r.chamber === 'senate' ? `${r.state}-S` : r.district);        // a House district label is already "TX-12"
+const seatCodeOfContest = c => (c.office === 'senator' ? `${c.state}-S` : c.district);
+function goToSeat(seat, tab) {
+  const dlg = $('#detail'); if (dlg.open) dlg.close();
+  F.seat = seat; if (tab) S.tab = tab;
+  filterChanged(); window.scrollTo({ top: 0 });
 }
 
-/* ---------- members table ---------- */
+function seatCard() {
+  if (!F.seat) return null;
+  const p = seatParts(F.seat), isSenate = p.part === 'S';
+  const holders = S.rows.filter(memberSeatMatches);
+  const hist = S.elec ? contestSummaries().filter(contestSeatMatches).sort((x, y) => y.year - x.year || (x.kind < y.kind ? -1 : 1)) : null;
+  const holderEls = holders.length
+    ? holders.map(r => el('span', { class: 'seat-holder' }, el('span', { class: 'dot', style: `background:var(--c-${r.group})` }),
+        el('button', { type: 'button', class: 'link-btn', text: r.name, onclick: () => openDetail(r) }),
+        el('span', { class: 'muted', text: `${r.partyName || 'no party'} · first took office ${r.firstStart.slice(0, 4)}${r.holdover ? ' · held over' : ''}` })))
+    : [el('p', { class: 'muted', text: 'No current member found for this seat. It may be vacant, or its numbering may have changed.' })];
+  let recent = null;
+  if (S.tab === 'now' && hist && hist.length) {
+    recent = el('div', {}, el('h3', { class: 'section-label', text: 'Recent results for this seat' }),
+      el('div', { class: 'tablewrap' }, tableEl([{ h: 'Year', num: 1 }, { h: 'Election type' }, { h: 'Winner' }, { h: 'Party' }, { h: 'Vote share', num: 1 }, { h: 'D−R gap', num: 1 }],
+        hist.slice(0, 6).map(c => [c.year, c.kind, c.winner ? c.winner.name : '', c.winner ? PARTY_NAME[c.winner.party] || c.winner.party : '',
+          c.winner && c.winner.share != null ? pct(c.winner.share) : (c.uncontested ? 'uncontested' : ''), c.margin == null ? '' : signed(c.margin)]))),
+      el('p', {}, el('button', { type: 'button', class: 'link-btn', text: `Open the full election history for ${seatLabel(F.seat)} →`, onclick: () => { S.tab = 'hist'; filterChanged(); } })));
+  }
+  return el('section', { class: 'card seat-card' },
+    el('div', { class: 'card-head' }, el('div', {}, el('h2', { text: `Seat: ${seatLabel(F.seat)}` }),
+      el('p', { class: 'card-sub', text: isSenate ? `Both ${geo().byCode.get(p.state) || p.state} Senate seats.` : `House district ${p.part === 'AL' ? 'at-large' : p.part} of ${geo().byCode.get(p.state) || p.state}. District numbers are redrawn after each census (and sometimes by courts), so results from different years can cover different territory.` })),
+      el('button', { type: 'button', text: 'Clear seat', onclick: () => { F.seat = ''; filterChanged(); } })),
+    el('h3', { class: 'section-label', text: 'Current holder' + (holders.length > 1 ? 's' : '') }),
+    el('div', { class: 'seat-holders' }, holderEls),
+    S.tab === 'hist' ? el('p', { class: 'note-line', text: 'Every contest for this seat is in the table below.' }) : null,
+    recent);
+}
+
+/* ---------- current members directory ---------- */
 const COLS = [
   { k: 'name', h: 'Name' }, { k: 'chamber', h: 'Chamber' }, { k: 'state', h: 'State' }, { k: 'district', h: 'District / class' },
-  { k: 'partyName', h: 'Party' }, { k: 'age', h: 'Age', num: 1 }, { k: 'firstStart', h: 'First term began' }, { k: 'bioguide', h: 'Bioguide' },
+  { k: 'partyName', h: 'Party' }, { k: 'age', h: 'Age', num: 1 }, { k: 'firstStart', h: 'First term began' }, { k: 'bioguide', h: 'Bioguide ID' },
 ];
 function membersCard(rows) {
   const count = el('span', { class: 'count' }), wrap = el('div', { class: 'tablewrap members-wrap' }), moreRow = el('div', { class: 'more-row' });
@@ -588,20 +692,21 @@ function membersCard(rows) {
       if (y == null || y === '') return -1;
       return (typeof x === 'number' ? x - y : String(x).localeCompare(String(y))) * dir;
     });
-    count.textContent = `${fmt(list.length)} of ${fmt(S.rows.length)} members`;
+    count.textContent = `${fmt(list.length)} of ${fmt(S.rows.length)} current members`;
     const head = el('tr', {}, COLS.map(c => el('th', { scope: 'col', class: c.num ? 'num' : '', 'aria-sort': S.sort.k === c.k ? (S.sort.dir > 0 ? 'ascending' : 'descending') : 'none' },
       el('button', { type: 'button', text: c.h + (S.sort.k === c.k ? (S.sort.dir > 0 ? ' ▲' : ' ▼') : ''), onclick: () => { S.sort = { k: c.k, dir: S.sort.k === c.k ? -S.sort.dir : 1 }; paint(); } }))));
     const shown = list.slice(0, S.mLimit);
     const body = shown.map(r => {
       const tr = el('tr', { class: 'clickable', tabindex: 0, 'aria-label': `Open details for ${r.name}` },
-        el('td', { text: r.name }), el('td', { text: r.chamber }), el('td', { text: r.state }), el('td', { text: r.district }),
+        el('td', {}, r.name, r.holdover ? el('span', { class: 'badge', title: `Scheduled term ended ${r.term.period.end}; the source still lists this member as serving until a successor is seated.`, text: 'held over' }) : null),
+        el('td', { text: r.chamber }), el('td', { text: r.state }), el('td', { text: r.district }),
         el('td', {}, el('span', { class: 'dot', style: `background:var(--c-${r.group})` }), r.partyName || '—'),
         el('td', { class: 'num', text: r.age == null ? '' : String(r.age) }), el('td', { text: r.firstStart }), el('td', { text: r.bioguide }));
       tr.onclick = () => openDetail(r);
       tr.onkeydown = e => { if (e.key === 'Enter') openDetail(r); };
       return tr;
     });
-    wrap.replaceChildren(list.length ? el('table', {}, el('thead', {}, head), el('tbody', {}, body)) : emptyNote('No members match the current filters.'));
+    wrap.replaceChildren(list.length ? el('table', {}, el('thead', {}, head), el('tbody', {}, body)) : emptyNote('No current members match the filters.'));
     const left = list.length - shown.length;
     moreRow.replaceChildren(...(left > 0 ? [el('span', { text: `Showing ${fmt(shown.length)} of ${fmt(list.length)}.` }),
       el('button', { type: 'button', text: `Show ${fmt(Math.min(150, left))} more`, onclick: () => { S.mLimit += 150; paint(); } }),
@@ -609,16 +714,16 @@ function membersCard(rows) {
   }
   paint();
   return el('section', { class: 'card' },
-    el('div', { class: 'card-head' }, el('div', {}, el('h2', { text: 'Members' }),
-      el('p', { class: 'card-sub', text: 'Everyone holding a seat on the selected date who matches the filters above. Select a row for full records.' }))),
+    el('div', { class: 'card-head' }, el('div', {}, el('h2', { text: 'Directory of current members' }),
+      el('p', { class: 'card-sub', text: 'Everyone holding a seat on the selected date who matches the filters. Select a row for terms, party history and the elections they won.' }))),
     el('div', { class: 'members-controls' }, count), wrap, moreRow);
 }
 
-/* ---------- contests explorer: every contest that matches the filters ---------- */
+/* ---------- election results table: every contest that matches the filters ---------- */
 const CCOLS = [
-  { k: 'year', h: 'Year', num: 1 }, { k: 'chamber', h: 'Chamber' }, { k: 'where', h: 'Contest' }, { k: 'kind', h: 'Kind' },
-  { k: 'winnerName', h: 'Winner' }, { k: 'winnerParty', h: 'Party' }, { k: 'share', h: 'Share', num: 1 },
-  { k: 'margin', h: 'Margin D−R', num: 1 }, { k: 'total', h: 'Total votes', num: 1 }, { k: 'linked', h: 'Member' },
+  { k: 'year', h: 'Year', num: 1 }, { k: 'chamber', h: 'Chamber' }, { k: 'where', h: 'Contest' }, { k: 'kind', h: 'Election type' },
+  { k: 'winnerName', h: 'Winner' }, { k: 'winnerParty', h: 'Party' }, { k: 'share', h: 'Vote share', num: 1 },
+  { k: 'margin', h: 'D−R gap', num: 1 }, { k: 'total', h: 'Total votes', num: 1 }, { k: 'linked', h: 'Current member?' },
 ];
 const padNum = n => String(n).padStart(4, '0');
 function contestRow(c) {
@@ -626,7 +731,8 @@ function contestRow(c) {
   const distNum = c.district ? c.district.replace(/^[A-Z]{2}-/, '') : '';
   return c._row = {
     c, year: c.year, chamber: chamberOf(c),
-    wk: c.stateName.toLowerCase() + ' ' + (distNum === 'AL' ? '0000' : /^\d+$/.test(distNum) ? padNum(distNum) : distNum) + ' ' + c.kind,
+    // tie-break key: Senate before House, then state A-Z, then district number
+    wk: (c.office === 'senator' ? '0 ' : '1 ') + c.stateName.toLowerCase() + ' ' + (distNum === 'AL' ? '0000' : /^\d+$/.test(distNum) ? padNum(distNum) : distNum) + ' ' + c.kind,
     where: c.stateName + (c.district ? ' ' + c.district.replace(/^[A-Z]{2}-/, '') : ''),
     kind: c.kind + (c.special && c.kind !== 'special' ? ' (special)' : ''),
     winnerName: c.winner ? c.winner.name : (c.advanced.length ? 'Runoff: ' + c.advanced.map(a => a.name).join(' / ') : ''),
@@ -640,21 +746,23 @@ function contestsCard() {
   const rows = S.fsums.map(contestRow);
   const count = el('span', { class: 'count' }), wrap = el('div', { class: 'tablewrap members-wrap' }), moreRow = el('div', { class: 'more-row' });
   let sortedFor = null, sorted = null;
+  const byWk = (a, b) => (a.wk < b.wk ? -1 : a.wk > b.wk ? 1 : 0);   // ties always read in the same, natural order
   function paint() {
     const { k, dir } = S.csort;
     if (sortedFor !== k + dir) {   // paging must not re-sort
       const key = k === 'where' ? 'wk' : k;
       sorted = rows.slice().sort((a, b) => {
-        const x = a[key], y = b[key];
-        if (x == null || x === '') return (y == null || y === '') ? (a.wk < b.wk ? -1 : 1) : 1;
-        if (y == null || y === '') return -1;
-        return (x < y ? -1 : x > y ? 1 : (a.wk < b.wk ? -1 : a.wk > b.wk ? 1 : 0)) * dir;
+        const x = a[key], y = b[key], nx = x == null || x === '', ny = y == null || y === '';
+        if (nx || ny) return nx && ny ? byWk(a, b) : nx ? 1 : -1;   // blanks last
+        const c = x < y ? -1 : x > y ? 1 : 0;
+        return c ? c * dir : byWk(a, b);
       });
       sortedFor = k + dir;
     }
     const shown = sorted.slice(0, S.cLimit);
     count.textContent = `${fmt(rows.length)} contests match`;
-    const head = el('tr', {}, CCOLS.map(c => el('th', { scope: 'col', class: c.num ? 'num' : '', 'aria-sort': S.csort.k === c.k ? (S.csort.dir > 0 ? 'ascending' : 'descending') : 'none' },
+    const head = el('tr', {}, CCOLS.map(c => el('th', { scope: 'col', class: c.num ? 'num' : '', 'aria-sort': S.csort.k === c.k ? (S.csort.dir > 0 ? 'ascending' : 'descending') : 'none',
+      title: c.k === 'margin' ? "Democratic candidate's vote share minus the Republican's, in percentage points (not the winner's margin)" : null },
       el('button', { type: 'button', text: c.h + (S.csort.k === c.k ? (S.csort.dir > 0 ? ' ▲' : ' ▼') : ''), onclick: () => { S.csort = { k: c.k, dir: S.csort.k === c.k ? -S.csort.dir : (c.num ? -1 : 1) }; paint(); } }))));
     const body = shown.map(r => {
       const tr = el('tr', { class: 'clickable', tabindex: 0, 'aria-label': `Open details for ${r.year} ${r.where}` },
@@ -676,8 +784,8 @@ function contestsCard() {
   }
   paint();
   return el('section', { class: 'card' },
-    el('div', { class: 'card-head' }, el('div', {}, el('h2', { text: 'Contests' }),
-      el('p', { class: 'card-sub', text: 'Every election contest that matches the filters above, across all years. Select a row to see every candidate. Winners are derived from the vote counts.' }),
+    el('div', { class: 'card-head' }, el('div', {}, el('h2', { text: 'Election results' }),
+      el('p', { class: 'card-sub', text: 'Every contest that matches the filters, across all years. Select a row to see every candidate. Winners are computed from the vote counts.' }),
       contestScope() ? el('p', { class: 'scope-line', text: contestScope() }) : null)),
     el('div', { class: 'members-controls' }, count), wrap, moreRow);
 }
@@ -686,16 +794,23 @@ async function openContest(c) {
   const dlg = $('#detail'), E = S.elec, raw = E.contests.get(c.id);
   const kindLabel = c.kind + (c.special && c.kind !== 'special' ? ' (special)' : '');
   const where = c.stateName + (c.district ? ' ' + c.district.replace(/^[A-Z]{2}-/, '') : '');
-  const resTable = tableEl([{ h: 'Candidate' }, { h: 'Party line' }, { h: 'Votes', num: 1 }, { h: 'Share', num: 1 }, { h: 'Outcome (derived)' }],
+  const resTable = tableEl([{ h: 'Candidate' }, { h: 'Party line' }, { h: 'Votes', num: 1 }, { h: 'Vote share', num: 1 }, { h: 'Outcome (computed)' }],
     c.results.map(x => [x.name + (x.cand.writeIn ? ' (write-in)' : ''), x.cand.partyLabel || '', x.votes == null ? '—' : fmt(x.votes), x.share == null ? '' : pct(x.share),
       x.outcome === 'advanced-to-runoff' ? 'advanced to runoff' : x.outcome]));
-  const person = c.winner && c.winner.cand.person ? S.persons.get(refId(c.winner.cand.person.reference)) : null;
+  const pid = c.winner && c.winner.cand.person ? refId(c.winner.cand.person.reference) : null;
+  const person = pid ? S.persons.get(pid) : null;
   const apiLinks = el('p', {}, ...[[`/Contest/${c.id}`, 'Contest'], [`/ContestResult?contest=Contest/${c.id}&_include=ContestResult:candidacy`, 'Results + candidates'], [`/Candidacy?contest=Contest/${c.id}`, 'Candidacies']]
     .flatMap(([h, t]) => [el('a', { href: h, target: '_blank', rel: 'noopener', text: `API: ${t}` }), ' · ']).slice(0, -1));
+  const seat = seatCodeOfContest(c);
+  const bridges = el('p', { class: 'bridges' },
+    person ? el('button', { type: 'button', class: 'link-btn', text: `Open the profile of ${person.name[0].text || 'the winner'} (current member)`, onclick: () => { const r = rowForPid(pid); if (r) openDetail(r); } }) : null,
+    person ? ' · ' : null,
+    el('button', { type: 'button', class: 'link-btn', text: `See every election for ${seatLabel(seat)}`, onclick: () => goToSeat(seat, 'hist') }));
   dlg.replaceChildren(el('div', { class: 'dlg' },
     el('div', { class: 'dlg-head' }, el('div', {}, el('h2', { id: 'detail-title', text: `${c.year} ${kindLabel}: ${where}` }),
-      el('p', { class: 'card-sub', text: `${CHAMBER_LABEL[chamberOf(c)]} · total votes ${c.total == null ? 'n/a' : fmt(c.total)} · ${c.reporting || 'official'}${c.uncontested ? ' · uncontested' : ''}${person ? ' · winner is a current member: ' + (person.name[0].text || '') : ''}` })),
+      el('p', { class: 'card-sub', text: `${CHAMBER_LABEL[chamberOf(c)]} · total votes ${c.total == null ? 'n/a' : fmt(c.total)} · ${c.reporting || 'official'}${c.uncontested ? ' · uncontested' : ''}` })),
       el('button', { type: 'button', text: 'Close', onclick: () => dlg.close() })),
+    bridges,
     el('div', {}, el('h3', { text: `Candidates (${c.results.length})` }), el('div', { class: 'tablewrap' }, resTable)),
     el('p', { class: 'hint', text: 'Outcomes are computed by polstats (plurality; runoff pairs marked), not taken from the source.' }),
     apiLinks,
@@ -703,7 +818,7 @@ async function openContest(c) {
   dlg.showModal();
 }
 
-/* ---------- detail dialog ---------- */
+/* ---------- member profile ---------- */
 async function openDetail(r) {
   const dlg = $('#detail');
   dlg.replaceChildren(el('div', { class: 'dlg' }, el('p', { text: 'Loading…' })));
@@ -717,15 +832,41 @@ async function openDetail(r) {
     affils.sort((a, b) => (a.period.start || '').localeCompare(b.period.start || ''));
     const affTable = tableEl([{ h: 'Party' }, { h: 'Start' }, { h: 'End' }],
       affils.map(a => { const o = S.orgs.get(refId(a.party.reference)); return [o ? o.name : '?', a.period.start || '', a.period.end || '']; }));
+
+    // the elections this person won, from the election-history data (this is the bridge between the two views)
+    const wins = S.elec ? (winsByPerson().get(r.pid) || []) : null;
+    let electionsBlock;
+    if (wins && wins.length) {
+      const body = wins.map(c => {
+        const row = contestRow(c);
+        const tr = el('tr', { class: 'clickable', tabindex: 0, 'aria-label': `Open the ${c.year} ${row.where} contest` },
+          el('td', { class: 'num', text: String(c.year) }), el('td', { text: row.kind }), el('td', { text: row.where }),
+          el('td', { class: 'num', text: row.share != null ? pct(row.share) : (c.uncontested ? 'uncontested' : '') }),
+          el('td', { class: 'num', text: c.margin == null ? '' : signed(c.margin) }));
+        tr.onclick = () => openContest(c);
+        tr.onkeydown = e => { if (e.key === 'Enter') openContest(c); };
+        return tr;
+      });
+      electionsBlock = el('div', { class: 'tablewrap' }, el('table', {},
+        el('thead', {}, el('tr', {}, ['Year', 'Election type', 'Contest', 'Vote share', 'D−R gap'].map((h, i) => el('th', { class: i === 0 || i > 2 ? 'num' : '', scope: 'col', text: h })))),
+        el('tbody', {}, body)));
+    } else {
+      electionsBlock = el('p', { class: 'hint', text: wins ? 'No election win is on record in the loaded data (1976–2024). That usually means appointed, or elected after 2024.' : 'Election results are still loading.' });
+    }
+    const seat = r.chamber ? seatCodeOfRow(r) : '';
+    const seatBtn = SEAT_RX.test(seat) ? el('p', {}, el('button', { type: 'button', class: 'link-btn', text: `See every election for ${seatLabel(seat)} →`, onclick: () => goToSeat(seat, 'hist') })) : null;
+
     const idList = el('dl', { class: 'ids' }, (r.person.identifier || []).flatMap(i => [el('dt', { text: i.system.replace(/^https?:\/\/(www\.)?/, '') }), el('dd', { text: i.value })]));
     const links = el('p', {}, ...[[`/Person/${r.pid}`, 'Person'], [`/OfficeTerm?person=Person/${r.pid}`, 'Terms'], [`/PartyAffiliation?person=Person/${r.pid}`, 'Affiliations'], [`/Person/${r.pid}/_history`, 'History']]
       .flatMap(([h, t]) => [el('a', { href: h, target: '_blank', rel: 'noopener', text: `API: ${t}` }), ' · ']).slice(0, -1));
     dlg.replaceChildren(el('div', { class: 'dlg' },
       el('div', { class: 'dlg-head' }, el('div', {}, el('h2', { id: 'detail-title', text: r.name }),
-        el('p', { class: 'card-sub', text: `${r.partyName || 'No party'} · ${r.chamber === 'senate' ? 'Senator' : 'House'} · ${r.state} ${r.district} · born ${r.birth || 'unknown'}${r.person.gender ? ' · ' + r.person.gender : ''}` })),
+        el('p', { class: 'card-sub', text: `${r.partyName || 'No party on record'} · ${r.chamber === 'senate' ? 'Senator' : r.chamber === 'house' ? 'House' : 'Member'} · ${r.state} ${r.district} · born ${r.birth || 'unknown'}${r.person.gender ? ' · ' + r.person.gender : ''}` }),
+        r.holdover ? el('p', { class: 'note-line', text: `Held over: the scheduled term ended ${r.term.period.end}, but the source still lists this member as serving, so they hold the seat until a successor is seated.` }) : null),
         el('button', { type: 'button', text: 'Close', onclick: () => dlg.close() })),
       el('div', {}, el('h3', { text: `Terms (${terms.length})` }), el('div', { class: 'tablewrap' }, termTable)),
-      el('div', {}, el('h3', { text: `Party affiliations (${affils.length})` }), affTable),
+      el('div', {}, el('h3', { text: wins ? `Elections won in the data (${wins.length})` : 'Elections won' }), electionsBlock, seatBtn),
+      el('div', {}, el('h3', { text: `Party affiliations (${affils.length})` }), el('div', { class: 'tablewrap' }, affTable)),
       el('div', {}, el('h3', { text: 'Identifiers' }), idList), links,
       el('details', {}, el('summary', { text: 'Raw Person JSON' }), el('pre', { text: JSON.stringify(r.person, null, 2) }))));
   } catch (e) {
@@ -749,8 +890,10 @@ function runChecks(rows) {
   const allStates = [...S.locs.values()].filter(l => code(l.type) === 'state' && identVal(l, SYS_USPS) && !['DC', 'PR', 'GU', 'VI', 'AS', 'MP'].includes(identVal(l, SYS_USPS))).map(l => identVal(l, SYS_USPS));
   const missing = allStates.filter(s => !senStates.has(s)).map(s => `${s}=0`);
   const senIssues = [...badStates, ...missing];
-  add(sen.length === 100 && !senIssues.length ? 'pass' : 'warn', `Senate seats filled: ${sen.length} of 100`,
-    senIssues.length ? `States without exactly 2 active senators: ${list(senIssues)}. Often a term ending on a special-election date; check the source dates.` : 'Every state has exactly 2 senators.');
+  const heldSen = sen.filter(r => r.holdover);
+  add(sen.length === 100 && !senIssues.length ? 'pass' : 'warn', `Senate seats filled: ${sen.length} of 100${heldSen.length ? ` (${heldSen.length} held over)` : ''}`,
+    (senIssues.length ? `States without exactly 2 senators: ${list(senIssues)}. ` : 'Every state has exactly 2 senators. ')
+    + (heldSen.length ? `Held over past a scheduled term end (${heldSen.map(r => `${r.name}, ${r.state}`).join('; ')}): the source still lists them as serving.` : ''));
 
   const reps = rows.filter(r => r.office === 'representative');
   add(reps.length === 435 ? 'pass' : reps.length < 435 ? 'warn' : 'fail', `House voting members: ${reps.length} of 435`,
@@ -824,24 +967,97 @@ function runChecks(rows) {
   }
   return out;
 }
-function checksCard(rows) {
+const strong = t => el('strong', { text: t });
+function coverageList() {
+  const pm = S.prov.members, pe = S.prov.elections;
+  const ys = S.elec ? [...S.elec.elections.values()].map(e => e.year) : [];
+  const [y0, y1] = ys.length ? [Math.min(...ys), Math.max(...ys)] : [null, null];
+  return el('ul', { class: 'cov-list' },
+    el('li', {}, strong('Current members: '), `unitedstates/congress-legislators (${pm ? pm.license : 'CC0-1.0'}), fetched ${pm ? fmtDate(pm.recorded) : 'n/a'}. ${fmt(S.persons.size)} people with their full term history. Only people serving today are included, so an earlier “as of” date shows just those who are still in Congress.`),
+    el('li', {}, strong('Election results: '), `MIT Election Data + Science Lab (${pe ? pe.license : 'CC0-1.0'}), U.S. Senate and House returns${y0 ? ` ${y0}–${y1}` : ''}, fetched ${pe ? fmtDate(pe.recorded) : 'n/a'}. ${S.elec ? fmt(S.elec.contests.size) : '…'} contests. Not included: anything after ${y1 || 'the last year loaded'}, such as special elections since and the next general election.`),
+    el('li', {}, strong('Computed values: '), 'winners are worked out from the vote counts (plurality; runoff pairs marked) and are not official or certified results. A member whose scheduled term end has just passed, but whom the source still lists as serving, is shown as “held over”.'),
+    el('li', {}, strong('Districts: '), 'district numbers are redrawn after each census (and sometimes by courts), so the same label can cover different territory in different years.'),
+    el('li', {}, el('a', { href: 'https://github.com/charlestirrell/polstats#data-sources', target: '_blank', rel: 'noopener', text: 'Sources, licenses and known limitations' }), ' (project README).'));
+}
+function notesCard(rows) {
   const counts = el('div', { class: 'counts' }, Object.entries(S.counts).map(([t, n]) => el('div', {}, el('b', { text: fmt(n) }), el('span', { text: t }))));
   const items = runChecks(rows);
   const label = { pass: 'Pass', warn: 'Check', fail: 'Fail' };
   const worst = items.some(i => i.level === 'fail') ? 'fail' : items.some(i => i.level === 'warn') ? 'warn' : 'pass';
   const passing = items.filter(i => i.level === 'pass').length;
-  // Collapsible and closed by default; the summary line keeps the overall result visible while closed.
+  // Collapsible and closed by default; this is reference material, not the first thing an analyst needs to see.
   const details = el('details', { class: 'checks-details' },
-    el('summary', {}, ICON[worst](), el('h2', { text: 'Data checks' }),
-      el('span', { class: 'card-sub', text: `${passing} of ${items.length} pass · overall: ${label[worst]}` })),
+    el('summary', {}, ICON[worst](), el('h2', { text: 'Data notes and quality checks' }),
+      el('span', { class: 'card-sub', text: `Sources, coverage and ${passing} of ${items.length} automated checks passing` })),
     el('div', { class: 'checks-body' },
-      el('p', { class: 'card-sub', text: "Checks always cover the full dataset; filters don't apply. Resources in the store:" }),
-      counts,
+      el('h3', { text: 'What is in this data' }), coverageList(),
+      el('h3', { text: 'Resources in the store' }), counts,
+      el('h3', { text: 'Automated checks' }),
+      el('p', { class: 'card-sub', text: "Checks always cover the full dataset; filters don't apply. “Check” means worth a look, usually a known limit of the source data." }),
       el('ul', { class: 'checks' }, items.map(i => el('li', { class: 'check' }, ICON[i.level](),
         el('div', {}, el('span', { class: 'state', text: label[i.level] }), el('span', { text: i.title }), el('span', { class: 'detail', text: i.detail })))))));
   details.open = !!S.checksOpen;
   details.addEventListener('toggle', () => { S.checksOpen = details.open; });   // survives re-renders and data reloads
-  return el('section', { class: 'card' }, details);
+  return el('section', { class: 'card notes-card', id: 'data-notes' }, details);
+}
+
+/* ---------- the two views ---------- */
+const SOURCES_URL = 'https://github.com/charlestirrell/polstats#data-sources';
+function setTab(k) {
+  if (S.tab === k) return;
+  S.tab = k; S.mLimit = 150; S.cLimit = 200;
+  saveHash(); render(); window.scrollTo({ top: 0 });
+}
+function buildTabs() {
+  const nav = $('#tabs');
+  nav.replaceChildren(...[['now', 'Congress now'], ['hist', 'Election history']].map(([k, t]) => {
+    const b = el('button', { type: 'button', role: 'tab', id: `tab-${k}`, class: 'tab', 'aria-selected': 'false', 'aria-controls': 'main' },
+      el('span', { class: 'tab-title', text: t }), el('span', { class: 'tab-sub', id: `tab-sub-${k}` }));
+    b.addEventListener('click', () => setTab(k));
+    b.addEventListener('keydown', e => {
+      if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') { e.preventDefault(); setTab(k === 'now' ? 'hist' : 'now'); $(`#tab-${S.tab}`).focus(); }
+    });
+    return b;
+  }));
+}
+function updateTabs() {
+  for (const k of ['now', 'hist']) $(`#tab-${k}`).setAttribute('aria-selected', String(S.tab === k));
+  const c = S.asOf ? congressOf(S.asOf) : null;
+  $('#tab-sub-now').textContent = c ? `${ord(c.n)} Congress · as of ${fmtDate(S.asOf)}` : 'loading…';
+  const ys = S.elec ? [...S.elec.elections.values()].map(e => e.year) : [];
+  $('#tab-sub-hist').textContent = S.elec ? `${Math.min(...ys)}–${Math.max(...ys)} · ${fmt(S.elec.contests.size)} contests` : S.elecError ? 'unavailable' : 'loading…';
+}
+
+function viewHeader(kind) {
+  const link = el('a', { href: SOURCES_URL, target: '_blank', rel: 'noopener', text: 'Sources and licenses' });
+  if (kind === 'now') {
+    const c = congressOf(S.asOf), pm = S.prov.members;
+    return el('div', { class: 'view-head' },
+      el('div', { class: 'view-title' }, el('h2', { text: 'Current members of Congress' }),
+        el('span', { class: 'pill pill-now', text: `CURRENT · ${ord(c.n)} Congress (${c.start}–${c.start + 2}) · as of ${fmtDate(S.asOf)}` })),
+      el('p', { class: 'coverage' }, 'Who serves right now. ', strong('Source: '), `unitedstates/congress-legislators, fetched ${pm ? fmtDate(pm.recorded) : 'n/a'}; elections held since then are not reflected. For who won past elections, open `,
+        el('button', { type: 'button', class: 'link-btn', text: 'Election history', onclick: () => setTab('hist') }), '. ', link, '.'));
+  }
+  const ys = S.elec ? [...S.elec.elections.values()].map(e => e.year) : [];
+  const y0 = ys.length ? Math.min(...ys) : 1976, y1 = ys.length ? Math.max(...ys) : 2024;
+  const nextGeneral = y1 + (y1 % 2 === 0 ? 2 : 1), thisYear = new Date().getFullYear();
+  return el('div', { class: 'view-head' },
+    el('div', { class: 'view-title' }, el('h2', { text: 'Election results' }), el('span', { class: 'pill pill-hist', text: `HISTORY · ${y0}–${y1}` })),
+    el('p', { class: 'coverage' }, 'How seats were won in past elections, including for people who no longer serve. ', strong('Source: '), 'MIT Election Data + Science Lab. ',
+      strong('Not included: '), `special elections after ${y1}${nextGeneral <= thisYear ? ` and the ${nextGeneral} general election` : ''}. Winners are computed from vote counts; they are not official or certified results. `, link, '.'));
+}
+
+function histTiles() {
+  const s = S.fsums, all = contestSummaries();
+  const win = g => s.filter(c => c.winner && groupOf(c.winner.party) === g).length;
+  const ys = s.map(c => c.year);
+  return el('div', { class: 'tiles' },
+    tileEl('Contests', fmt(s.length), s.length !== all.length ? `of ${fmt(all.length)}` : 'Senate and House'),
+    tileEl('Election years', ys.length ? `${Math.min(...ys)}–${Math.max(...ys)}` : '–', `${new Set(ys).size} years with contests`),
+    tileEl('Won by Democrats', fmt(win('D')), 'computed from votes'),
+    tileEl('Won by Republicans', fmt(win('R')), 'computed from votes'),
+    tileEl('Won by independents / others', fmt(win('I')), 'computed from votes'),
+    tileEl('Uncontested', fmt(s.filter(c => c.uncontested).length), 'no vote counts in the source'));
 }
 
 /* ---------- render ---------- */
@@ -851,10 +1067,10 @@ function updateBounds() {
   if (ten.length) BOUNDS.tenure = [0, Math.ceil(Math.max(...ten))];
   if (S.elec) { const ys = [...S.elec.elections.values()].map(e => e.year); if (ys.length) BOUNDS.years = [Math.min(...ys), Math.max(...ys)]; }
 }
-function cachedChecksCard(all) {  // checks ignore the filters, so only rebuild when the data changes
+function cachedNotesCard(all) {  // the notes and checks ignore the filters, so only rebuild when the data changes
   const c = S.checksCache;
   if (c && c.rows === S.rows && c.elec === S.elec && c.asOf === S.asOf) return c.node;
-  const node = checksCard(all);
+  const node = notesCard(all);
   S.checksCache = { rows: S.rows, elec: S.elec, asOf: S.asOf, node };
   return node;
 }
@@ -865,25 +1081,40 @@ function render() {
   const allSums = S.elec ? contestSummaries() : [];
   S.fsums = allSums.filter(contestMatches);
   syncFilterBar({ m: rows.length, mt: all.length, c: S.fsums.length, ct: allSums.length });
+  updateTabs();
+  main.dataset.view = S.tab; main.setAttribute('role', 'tabpanel'); main.setAttribute('aria-labelledby', `tab-${S.tab}`);
   main.replaceChildren();
-  main.append(tilesSection(rows));
-  if (S.asOf !== todayISO()) {
-    main.append(el('p', { class: 'scope-note', role: 'note' }, ICON.warn(),
-      el('span', {}, el('strong', { text: 'Data scope. ' }),
-        'Only people serving today (and their earlier terms) are loaded. For other dates this page shows just those people, not the full Congress of that date, so seat counts and the checks below will look incomplete.')));
+  const draws = [];
+  const addCard = c => { draws.push(c.draw); return c.node; };
+  const seat = seatCard();
+
+  if (S.tab === 'now') {
+    main.append(viewHeader('now'));
+    if (seat) main.append(seat);
+    main.append(tilesSection(rows));
+    if (S.asOf !== todayISO()) {
+      main.append(el('p', { class: 'scope-note', role: 'note' }, ICON.warn(),
+        el('span', {}, strong('Past date. '), 'Only people serving today (and their earlier terms) are loaded, so this shows just those who are still in Congress, not the full Congress of that date. To see who won past elections, open ',
+          el('button', { type: 'button', class: 'link-btn', text: 'Election history', onclick: () => setTab('hist') }), '.')));
+    }
+    main.append(sectionLabel('Control of Congress'), gridOf(addCard(compositionCard(rows)), addCard(stateCard(rows))),
+      sectionLabel('Who they are'), gridOf(addCard(ageCard(rows)), addCard(tenureCard(rows))),
+      sectionLabel('Directory'), membersCard(rows));
+  } else {
+    main.append(viewHeader('hist'));
+    if (seat) main.append(seat);
+    if (S.elecError) main.append(el('p', { class: 'scope-note', role: 'alert' }, 'Could not load election results: ' + S.elecError));
+    else if (!S.elec) main.append(el('section', { class: 'card' }, el('h2', { text: 'Election results' }), el('p', { class: 'card-sub', text: 'Loading election results…' })));
+    else if (!S.elec.contests.size) main.append(el('section', { class: 'card' }, el('h2', { text: 'Election results' }), el('p', { class: 'card-sub', text: 'No election data loaded yet. Run the MEDSL loader (see the README).' })));
+    else {
+      main.append(histTiles(),
+        sectionLabel('How seats were won'), gridOf(...chambersShown().map(ch => addCard(seatsWonCard(ch)))),
+        sectionLabel('How close the races were'), gridOf(...chambersShown().map(ch => addCard(marginsCard(ch)))),
+        sectionLabel('Every contest'), contestsCard());
+    }
   }
-  main.append(cachedChecksCard(all));
-  const g1 = el('div', { class: 'grid' }), g2 = el('div', { class: 'grid' });
-  const cards = [compositionCard(rows), stateCard(rows), ageCard(rows), tenureCard(rows)];
-  g1.append(cards[0].node, cards[1].node); g2.append(cards[2].node, cards[3].node);
-  const g3 = el('div', { class: 'grid' });
-  const elecCards = electionsSection();
-  g3.append(...elecCards.map(c => c.node || c));
-  main.append(g1, g2, g3);
-  const contests = contestsCard();
-  if (contests) main.append(contests);
-  main.append(membersCard(rows));
-  [...cards, ...elecCards.filter(c => c.draw)].forEach(c => c.draw());
+  main.append(cachedNotesCard(all));
+  draws.forEach(d => d());
 }
 let _pending = false;  // coalesce bursts of filter changes (slider drags) into one render per task
 const scheduleRender = () => { if (!_pending) { _pending = true; setTimeout(() => { _pending = false; render(); }, 0); } };
@@ -892,7 +1123,7 @@ const scheduleRender = () => { if (!_pending) { _pending = true; setTimeout(() =
 const todayISO = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
 function banner(msg) { const b = $('#banner'); b.hidden = !msg; b.textContent = msg || ''; }
 function saveHash() {
-  const h = filtersToHash({ asof: S.asOf && S.asOf !== todayISO() ? S.asOf : '' });
+  const h = filtersToHash({ asof: S.asOf && S.asOf !== todayISO() ? S.asOf : '', v: S.tab === 'hist' ? 'hist' : '' });
   try { history.replaceState(null, '', location.pathname + location.search + (h ? '#' + h : '')); } catch (_) { /* e.g. sandboxed frame */ }
 }
 async function setDate(d) {
@@ -919,13 +1150,21 @@ function initTheme() {
 }
 async function boot() {
   initTheme();
-  const start = filtersFromHash(location.hash);   // filters (and the as-of date) can come from a shared link
+  const start = filtersFromHash(location.hash);   // filters, the view and the as-of date can come from a shared link
+  S.tab = start.view;
+  buildTabs();
   buildFilterBar({ onChange: () => { saveHash(); scheduleRender(); }, onDate: d => setDate(d) });
   const input = FB.asof; input.value = start.asof || todayISO();
   $('#detail').addEventListener('click', e => { if (e.target === e.currentTarget) e.currentTarget.close(); });
+  $('#notes-link').addEventListener('click', e => {
+    e.preventDefault();
+    const card = document.getElementById('data-notes');
+    if (card) { card.querySelector('details').open = true; card.scrollIntoView({ behavior: 'smooth' }); }
+  });
   let t; addEventListener('resize', () => { clearTimeout(t); t = setTimeout(() => S.rows.length && render(), 150); });
   addEventListener('hashchange', () => {   // back/forward or an edited link
     const st = filtersFromHash(location.hash);
+    S.tab = st.view;
     if (st.asof && st.asof !== S.asOf) { input.value = st.asof; setDate(st.asof); } else scheduleRender();
   });
   try { await loadStatic(); await loadAsOf(input.value); render(); }

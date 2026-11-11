@@ -10,7 +10,7 @@ time-aware dataset with stable cross-reference IDs, a searchable REST API, and a
 data-quality dashboard. **The repository contains no data**: every dataset is pulled from its original publisher by
 a reproducible, checksum-verified command.
 
-![polstats data explorer: chamber composition, delegation sizes, age distribution](docs/images/explorer-overview.jpg)
+![US Congress & Elections Explorer: current Congress and election history](docs/images/explorer-overview.jpg)
 
 ## Status
 
@@ -22,7 +22,7 @@ is not yet stable and there is no authentication, so run it locally.
 | Current members of Congress: terms, party history, cross-reference IDs | 2025–26 special elections and 2026 results (not yet published by the source) |
 | Senate and House election results 1976–2024 (11,745 contests, 36,000 candidates) | Historical members (so past dates show only today's members) |
 | REST API with search, paging, `_include`, versioning | Bills, votes, committees, campaign finance |
-| Explorer UI with charts, tables and data checks | Authentication, deletes, a hosted instance |
+| Explorer UI: current Congress and election history, seat lookup, live filters | Authentication, deletes, a hosted instance |
 | Reproducible, checksum-verified data fetching | |
 
 ## Features
@@ -40,8 +40,10 @@ is not yet stable and there is no authentication, so run it locally.
 - **Live filtering across everything**: one filter bar (search, chamber, party, states, age, years in Congress,
   election years and kinds, vote margin, contested or not, ...) updates every chart, table and count instantly, and
   filters live in the URL so any view can be shared.
-- **Verification UI**: hover any chart bar for exact values, flip any chart to a table, and read a list of
-  automated data checks (seat counts, duplicate seats, vote totals, dangling references).
+- **Current Congress and election history, kept apart**: two views with their own filters, sources and coverage statements,
+  joined by seat and by person. Analysts can type a district code (TX-12) and see who holds it and how it was won.
+- **Honest about gaps**: held-over seats, vacancies, uncontested races, and what the data does not cover are shown on the
+  page, and a collapsed notes section lists sources and automated checks (seat counts, duplicate seats, vote totals).
 
 ## Quick start
 
@@ -122,6 +124,7 @@ Ten resource types, stored as versioned JSON documents. Full detail in [docs/DES
 Search with typed parameters; unknown parameters are rejected with a 400 rather than silently ignored.
 
 ```text
+GET /Provenance?source=MIT%20Election%20Data%20and%20Science%20Lab&_count=1    # where the data came from
 GET /OfficeTerm?state=TX&chamber=senate&active-on=2026-11-10&_include=OfficeTerm:person
 GET /OfficeTerm?state=TX&chamber=house&party=R&active-on=2026-11-10
 GET /Person?identifier=https://bioguide.congress.gov|C000127
@@ -142,36 +145,59 @@ without putting authentication in front of it. The explorer UI only reads.
 
 ## Explorer UI
 
-A dependency-free page served by the API itself (plain HTML/CSS/JS, hand-built SVG charts, no build step, no CDN)
-that reads everything through the REST API. It shows chamber composition, delegation sizes, age and tenure by party,
-seats won per election year, a Democratic-vs-Republican margin view for any election year (per-contest bars for the
-Senate, a histogram of districts for the House; switch with the Chamber selector), a searchable member table with full
-records, a contests explorer, and a **Data checks** panel (collapsed by default; its summary line keeps the overall result visible). Every chart has a table view and keyboard-accessible
-tooltips; light and dark themes are supported.
+A dependency-free page served by the API itself (plain HTML/CSS/JS, hand-built SVG charts, no build step, no CDN) that
+reads everything through the REST API. It has **two clearly separate views**, because they answer different questions
+from different data:
 
-![The live filter bar with advanced filters open](docs/images/explorer-filters.jpg)
+| View | Question | Data |
+|---|---|---|
+| **Congress now** | Who serves today, and who controls each chamber? | Current members, *as of a date* |
+| **Election history** | How were seats won in past elections? | 1976–2024 election results, including people who no longer serve |
+
+Each view has its own header (a "CURRENT" or "HISTORY" badge), a plain statement of its source and what it leaves out,
+its own count line and its own filters. The two are connected: a member's profile lists the elections they won, and a
+contest links to the winner and to the seat's full history.
+
+![Congress now: tiles and chamber composition with majority lines](docs/images/explorer-overview.jpg)
+
+**Congress now** shows chamber composition (with the 51 / 218 majority line, vacant seats, and a *by party* / *by caucus*
+toggle so independents who caucus with a party can be counted with it), seats by state, age and years-in-Congress
+profiles, and a directory of current members. Members whose scheduled term has just ended but whom the source still lists as
+serving are shown as **held over** and counted, not silently dropped.
+
+**Election history** shows seats won per election year and the Democratic-minus-Republican (D−R) gap for each chamber, and
+a sortable table of every contest. Winners are computed from vote counts; the page says they are not official results.
+
+![Election history: seats won by party, by year, per chamber](docs/images/explorer-elections.jpg)
+
+Both views share: chart/table twins, keyboard-accessible tooltips, light and dark themes, and a collapsed **Data notes and
+quality checks** section at the bottom (sources, coverage, and the automated checks) that is never affected by filters.
+
+### Finding a seat
+
+Analysts think in district codes, so seats are first-class. Type **TX-12**, `tx12`, "Texas 12th", `vt-al`, "Vermont at-large"
+or "TX senate" in the search box, or use **Find a seat**. The seat card shows the current holder and the seat's recent
+results, and links to its full election history. (District numbers are redrawn after each census, so an old TX-12 is not
+the same territory as today's.)
+
+![A seat: current holder and recent results](docs/images/explorer-seat.jpg)
 
 ### Live filtering
 
-A sticky filter bar scopes the whole page at once, with no reloads: members, contests and every chart re-render as you
-type or drag a slider, and the bar shows how many members and contests match.
+A sticky filter bar scopes the active view at once, with no reloads: cards, tables and counts re-render as you type or drag a
+slider. It shows only the controls that apply to the view you are in.
 
-- **Everywhere:** free-text search (member names, states, candidate names), chamber, party, and a searchable
-  multi-select for states. For contests, party means the *winner's* party.
-- **Members only:** gender, age range, years since first term. The *As of* date re-scopes who is in office.
-- **Elections only:** election-year range, kind (general, special, runoff, primary), margin range (Democratic minus
-  Republican), contested vs. uncontested, and "winner is a current member".
+- **Both views:** search (names, states, seats, candidates), chamber, party (for contests, the *winner's* party), a searchable
+  multi-select for states, and the seat finder.
+- **Congress now:** the *As of* date, gender, age range, years since first term.
+- **Election history:** election year (or a range), election type (general, special, runoff, primary), D−R gap range,
+  contested vs. uncontested, and "winner is a current member".
 - **Click to filter:** click a state bar, a party segment or chamber name, an age or tenure bar, an election-year bar or a
-  margin band, and it becomes a filter. Each active filter is a chip you can remove; **Reset all** clears them.
-- **Contests explorer:** a sortable table of every contest matching the filters (all years, both chambers); select a
-  row to see every candidate, their votes and the derived outcome.
-- **Shareable:** all filters and the as-of date are stored in the URL hash, so copying the address shares the exact
-  view. The hash is treated as untrusted input and sanitised on load.
-- **Data checks are never filtered**: they always run on the full dataset so a filter can't hide a problem.
+  gap band, and it becomes a filter. Each active filter is a chip you can remove; **Reset all** clears them.
+- **Shareable:** the view, all filters, the seat and the as-of date live in the URL hash, so copying the address shares the
+  exact view. The hash is treated as untrusted input and sanitised on load.
 
-![Senate seats won by party and 2024 vote margins](docs/images/explorer-elections.jpg)
-
-![House seats won by party and 2024 district margins](docs/images/explorer-house.jpg)
+![The live filter bar with current-member filters open](docs/images/explorer-filters.jpg)
 
 ## Project layout
 
@@ -233,7 +259,11 @@ compliance target, and nothing in the project depends on knowing FHIR.
   Ranked-choice races are decided on the counts the source provides.
 - Winners link to a `Person` only when state, term-start window and family name all agree, so only people serving today
   can link. Members elected in special elections after 2024 (about a dozen House members and two senators) have no
-  election record because the source ends with 2024; the Data checks panel lists them.
+  election record because the source ends with 2024; the Data notes section lists them.
+- **Held-over members.** A member whose scheduled term end has just passed (within 120 days) but whom the source still lists
+  as serving, typically an appointee whose term ends on the special-election date, is shown as serving and flagged "held
+  over". This is derived in the explorer, not stored as data. The Senate therefore shows all 100 seats. Vacancies are shown
+  for the House only when the page is at today's date and no member filter is active.
 - **Source quirks, handled and surfaced rather than hidden:** uncontested races store a placeholder vote (`1` or `-1`),
   so they are flagged `uncontested` and carry no vote counts; catch-all rows (write-ins, "BLANK VOTE/SCATTERING",
   "EXHAUSTED BALLOT", ...) are kept but never win; some states' totals exclude blank ballots; candidates on several
