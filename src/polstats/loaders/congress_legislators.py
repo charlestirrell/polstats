@@ -24,7 +24,7 @@ from ..store import Store, dsn
 
 SOURCE = "unitedstates/congress-legislators"
 SOURCE_URL = "https://github.com/unitedstates/congress-legislators"
-LICENSE = "CC0-1.0 (as reported by the project; verify)"
+LICENSE = "CC0-1.0"
 
 SYS_NATION = "urn:polstats:nation"
 SYS_DISTRICT = "urn:polstats:district"

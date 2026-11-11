@@ -12,13 +12,13 @@ a reproducible, checksum-verified command.
 
 ## Status
 
-Early alpha (v0.1). It works end to end for the current Congress and Senate election history; the API is not yet
-stable and there is no authentication, so run it locally.
+Early alpha (v0.1). It works end to end for the current Congress and for Senate and House election history; the API
+is not yet stable and there is no authentication, so run it locally.
 
 | Works today | Not yet |
 |---|---|
-| Current members of Congress: terms, party history, cross-reference IDs | House election results (loader written, see [Roadmap](#roadmap)) |
-| Senate election results 1976–2024 (862 contests) | Historical members (so past dates show only today's members) |
+| Current members of Congress: terms, party history, cross-reference IDs | 2025–26 special elections and 2026 results (not yet published by the source) |
+| Senate and House election results 1976–2024 (11,745 contests, 36,000 candidates) | Historical members (so past dates show only today's members) |
 | REST API with search, paging, `_include`, versioning | Bills, votes, committees, campaign finance |
 | Explorer UI with charts, tables and data checks | Authentication, deletes, a hosted instance |
 | Reproducible, checksum-verified data fetching | |
@@ -35,6 +35,9 @@ stable and there is no authentication, so run it locally.
 - **Versioned records**: every update creates a new version; `GET /Person/{id}/_history` shows them all.
 - **Idempotent, fail-loud loaders**: re-running a load changes nothing unless the source changed, and a key
   collision raises an error instead of silently overwriting data.
+- **Live filtering across everything**: one filter bar (search, chamber, party, states, age, years in Congress,
+  election years and kinds, vote margin, contested or not, ...) updates every chart, table and count instantly, and
+  filters live in the URL so any view can be shared.
 - **Verification UI**: hover any chart bar for exact values, flip any chart to a table, and read a list of
   automated data checks (seat counts, duplicate seats, vote totals, dangling references).
 
@@ -44,17 +47,20 @@ stable and there is no authentication, so run it locally.
 or [Colima](https://github.com/abiosoft/colima)).
 
 ```bash
-git clone <repo-url> polstats && cd polstats
-docker compose up -d --wait        # PostgreSQL 17 on localhost:5432 (development credentials)
+git clone https://github.com/charlestirrell/polstats.git && cd polstats
+docker compose up -d --wait        # PostgreSQL 17, bound to 127.0.0.1:5432 (public development password)
 uv sync                            # install dependencies
 export PYTHONPATH=src              # PowerShell: $env:PYTHONPATH = "src"
 
 # 1. fetch raw data into raw/ (git-ignored), verifying checksums
 uv run python -P -m polstats.fetch medsl-senate congress-legislators
+#    optional: House results; needs a Dataverse form, see "Data sources" below
+# uv run python -P -m polstats.fetch medsl-house
 
-# 2. load it
+# 2. load it (members first, so election winners can be linked to people)
 uv run python -P -m polstats.loaders.congress_legislators raw/congress-legislators/legislators-current.json
 uv run python -P -m polstats.loaders.medsl raw/medsl-senate/1976-2024-senate-state.csv
+# uv run python -P -m polstats.loaders.medsl raw/medsl-house/1976-2024-house.csv   # ~2 minutes
 
 # 3. run the API + explorer
 uv run uvicorn polstats.api.app:app --port 8000
@@ -69,7 +75,7 @@ themselves if Postgres isn't running.
 
 | Source | Provides | License | Fetched as |
 |---|---|---|---|
-| [unitedstates/congress-legislators](https://github.com/unitedstates/congress-legislators) | Members of Congress, terms, party, IDs | CC0 (as reported by the project; verify) | `congress-legislators` (mutable: re-fetch with `--refresh`) |
+| [unitedstates/congress-legislators](https://github.com/unitedstates/congress-legislators) | Members of Congress, terms, party, IDs | CC0 1.0 (the project's LICENSE file) | `congress-legislators` (mutable: re-fetch with `--refresh`) |
 | [MIT Election Data + Science Lab: U.S. Senate 1976–2024](https://doi.org/10.7910/DVN/PEJ5QU) | Statewide Senate returns | CC0 1.0 (per Dataverse) | `medsl-senate` |
 | [MIT Election Data + Science Lab: U.S. House 1976–2024](https://doi.org/10.7910/DVN/IG0UN2) | House district returns | CC0 1.0 (per Dataverse) | `medsl-house` (needs a Dataverse form, see below) |
 
@@ -124,18 +130,46 @@ GET /Person/{id}/_history
 GET /metadata                      # every resource type and its search parameters
 ```
 
-Results come back as a `Bundle` with `total`, paging links (`_count`, `_offset`) and optional `_include`. `POST`
-creates, `PUT` updates and honours `If-Match: W/"<version>"`. Errors are `OperationOutcome` documents.
+Results come back as a `Bundle` with `total`, paging links (`_count`, `_offset`) and optional `_include`. Errors are
+`OperationOutcome` documents.
+
+**The API is read-only by default.** There is no authentication, so `POST` (create) and `PUT` (update, which honours
+`If-Match: W/"<version>"`) answer `403` unless you start the server with `POLSTATS_ALLOW_WRITES=1`. Enable writes only on
+a machine you control. The server listens on `127.0.0.1` by default; don't expose it (or the database) on a network
+without putting authentication in front of it. The explorer UI only reads.
 
 ## Explorer UI
 
 A dependency-free page served by the API itself (plain HTML/CSS/JS, hand-built SVG charts, no build step, no CDN)
 that reads everything through the REST API. It shows chamber composition, delegation sizes, age and tenure by party,
-Senate seats won per election year, a Democratic-vs-Republican margin chart for any election year, a searchable member
-table with full records, and a **Data checks** panel. Every chart has a table view and keyboard-accessible tooltips;
-light and dark themes are supported.
+seats won per election year, a Democratic-vs-Republican margin view for any election year (per-contest bars for the
+Senate, a histogram of districts for the House; switch with the Chamber selector), a searchable member table with full
+records, a contests explorer, and a **Data checks** panel (collapsed by default; its summary line keeps the overall result visible). Every chart has a table view and keyboard-accessible
+tooltips; light and dark themes are supported.
+
+![The live filter bar with advanced filters open](docs/images/explorer-filters.jpg)
+
+### Live filtering
+
+A sticky filter bar scopes the whole page at once, with no reloads: members, contests and every chart re-render as you
+type or drag a slider, and the bar shows how many members and contests match.
+
+- **Everywhere:** free-text search (member names, states, candidate names), chamber, party, and a searchable
+  multi-select for states. For contests, party means the *winner's* party.
+- **Members only:** gender, age range, years since first term. The *As of* date re-scopes who is in office.
+- **Elections only:** election-year range, kind (general, special, runoff, primary), margin range (Democratic minus
+  Republican), contested vs. uncontested, and "winner is a current member".
+- **Click to filter:** click a state bar, a party segment or chamber name, an age or tenure bar, an election-year bar or a
+  margin band, and it becomes a filter. Each active filter is a chip you can remove; **Reset all** clears them.
+- **Contests explorer:** a sortable table of every contest matching the filters (all years, both chambers); select a
+  row to see every candidate, their votes and the derived outcome.
+- **Shareable:** all filters and the as-of date are stored in the URL hash, so copying the address shares the exact
+  view. The hash is treated as untrusted input and sanitised on load.
+- **Data checks are never filtered**: they always run on the full dataset so a filter can't hide a problem.
 
 ![Senate seats won by party and 2024 vote margins](docs/images/explorer-elections.jpg)
+
+![House seats won by party and 2024 district margins](docs/images/explorer-house.jpg)
 
 ## Project layout
 
@@ -150,7 +184,7 @@ src/polstats/
   fetch.py                reproducible, checksum-verified downloads
   loaders/                one idempotent loader per source
   api/                    FastAPI app and search-parameter definitions
-  web/                    the explorer UI (static files)
+  web/                    the explorer UI (static files: app.js, filters.js, style.css)
 tests/                    pytest suite (including repo-hygiene guards)
 docs/                     design notes and screenshots
 sql/                      example queries
@@ -194,18 +228,25 @@ compliance target, and nothing in the project depends on knowing FHIR.
 - Districts are identified as `STATE-NUMBER` (`AL` = at-large) with no per-Congress boundary versioning.
 - Election outcomes are derived: the plurality leader wins; a first round followed by a runoff marks the runoff pair
   `advanced-to-runoff`. Source data has no election dates, so `Election.date` is set only for regular November generals.
+  Ranked-choice races are decided on the counts the source provides.
 - Winners link to a `Person` only when state, term-start window and family name all agree, so only people serving today
-  can link.
-- The House loader is written from the documented format and tested on synthetic data; it has not yet been run on
-  the real House file.
+  can link. Members elected in special elections after 2024 (about a dozen House members and two senators) have no
+  election record because the source ends with 2024; the Data checks panel lists them.
+- **Source quirks, handled and surfaced rather than hidden:** uncontested races store a placeholder vote (`1` or `-1`),
+  so they are flagged `uncontested` and carry no vote counts; catch-all rows (write-ins, "BLANK VOTE/SCATTERING",
+  "EXHAUSTED BALLOT", ...) are kept but never win; some states' totals exclude blank ballots; candidates on several
+  party lines (fusion tickets) are merged and take their major-party line; and 4 contests (2002 IN-2, 2012 CT-3,
+  2016 CT-1, 2018 ME-2) have candidate votes that disagree with the source's own total. The loader reports the last.
+- Maine's ranked-choice rounds, Georgia's `pre`/`gen` runoff labelling and Texas/Louisiana primary runoffs are handled
+  explicitly; see [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Roadmap
 
-- Load House results (MEDSL) and verify the loader against the real file
 - Load historical members so any past date is complete
 - Bills and roll-call votes (Congress.gov API, Voteview), committees and committee membership
 - Campaign finance (FEC) and candidate backgrounds (Wikidata)
 - Per-Congress district boundaries
+- 2025–26 special elections and 2026 general results once published (MEDSL or state sources)
 - Authentication, deletes, CI, and a documented public deployment recipe
 
 ## Contributing

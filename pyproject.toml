@@ -21,6 +21,11 @@ dependencies = [
     "uvicorn>=0.30",
 ]
 
+[project.urls]
+Homepage = "https://github.com/charlestirrell/polstats"
+Repository = "https://github.com/charlestirrell/polstats"
+Issues = "https://github.com/charlestirrell/polstats/issues"
+
 [dependency-groups]
 dev = ["pytest>=8", "httpx>=0.27"]
 

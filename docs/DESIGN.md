@@ -57,9 +57,9 @@ Unknown fields are rejected.
 | `OfficeTerm` | `person`, `office` (senator, representative, delegate, resident-commissioner), `chamber`, `state`, `district`, `senateClass`, `period`, `endReason`, `electedIn` (reserved) |
 | `PartyAffiliation` | `person`, `party` (Organization), `period` |
 | `Election` | `year`, `kind` (general, primary, special, runoff), `date` (only where derivable) |
-| `Contest` | `election`, `office`, `state`, `district`, `special`, `totalVotes`, `reporting` |
+| `Contest` | `election`, `office`, `state`, `district`, `special`, `uncontested`, `totalVotes`, `reporting` |
 | `Candidacy` | `contest`, `name`, `person` (when unambiguous), `party`, `partyLabel`, `writeIn` |
-| `ContestResult` | `contest`, `candidacy`, `votes`, `voteShare`, `outcome`, `outcomeDerived`; plus `year`, `office`, `state`, `partyCode` denormalised for search |
+| `ContestResult` | `contest`, `candidacy`, `votes` (absent when uncontested), `voteShare`, `outcome`, `outcomeDerived`; plus `year`, `office`, `state`, `partyCode` denormalised for search |
 | `Provenance` | `target[]`, `source`, `sourceUrl`, `sourceVersion`, `recorded`, `license` |
 
 Natural keys (used for idempotent upserts) are identifiers in `urn:polstats:*` systems, for example
@@ -93,7 +93,7 @@ In use:
 | Source | Used for |
 |---|---|
 | unitedstates/congress-legislators | `Person`, `OfficeTerm`, `PartyAffiliation`, cross-reference IDs |
-| MIT Election Data + Science Lab (Senate, House) | `Election`, `Contest`, `Candidacy`, `ContestResult` |
+| MIT Election Data + Science Lab (Senate, House 1976-2024) | `Election`, `Contest`, `Candidacy`, `ContestResult` |
 
 Candidates, not yet integrated (verify current terms, formats and licensing before building a loader):
 
@@ -115,6 +115,18 @@ Services that have shut down and should not be depended on: the ProPublica Congr
 - **Person links.** A winning candidacy links to a `Person` only if the state, a term starting between 1 January of
   the election year and 1 March of the next, and the family name all agree on exactly one person.
 - **Election dates.** Set only for regular November generals (Tuesday after the first Monday in November).
+- **Uncontested races.** One named candidate and only a placeholder vote (`1`, or `-1` in Florida) means the race is
+  `uncontested`: the contest keeps no total and the result keeps no votes or share (the winner is still recorded).
+- **Catch-all rows.** Write-ins, scattering, blank/void/spoiled/under/over votes, ranked-choice "exhausted ballots",
+  "all others", "miscellaneous" and party names used as candidate names are stored as candidacies but never win and
+  never get a person link. Blank, void and spoiled ballots are also excluded from reconciliation and vote share when
+  the source's stated total excludes them.
+- **Fusion tickets.** A candidate listed on several party lines is one candidacy with the summed votes; the party is
+  the best-supported Democratic or Republican line if there is one, otherwise the line with the most votes.
+- **Runoffs.** A `runoff` flag (House), a `runoff` stage, or a Georgia `gen` stage that follows a `pre` stage marks a
+  runoff; the first round's top candidates who appear in the runoff are `advanced-to-runoff`.
+- **Source inconsistencies.** If candidate votes (net of non-vote ballots) differ from the source's total, the loader
+  reports the contest instead of adjusting any number.
 
 ## 7. Decisions
 

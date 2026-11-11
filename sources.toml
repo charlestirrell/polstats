@@ -9,7 +9,7 @@
 name = "congress-legislators"
 description = "Members of Congress 1789-present (current file): names, terms, party, cross-reference IDs"
 homepage = "https://github.com/unitedstates/congress-legislators"
-license = "CC0-1.0 (as reported by the project; verify)"
+license = "CC0-1.0 (the project's LICENSE file; its README dedicates it to the public domain)"
 mutable = true
 
   [[source.file]]
@@ -52,7 +52,7 @@ requires_guestbook = true
 
   [[source.file]]
   dataverse_id = 13592823
-  dest = "1976-2024-house.tsv"
+  dest = "1976-2024-house.csv"
   original = true
   md5 = "a9566ac393913a1af343284e837c17bb"
 

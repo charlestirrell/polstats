@@ -42,6 +42,12 @@ Tests that need Postgres use a separate `polstats_test` database and skip if the
   interpolate user input into SQL.
 - The explorer UI (`src/polstats/web/`) reads only through the REST API. Chart colours follow the party, and every
   chart needs a table view and keyboard-accessible tooltips.
+- Views must respect the global filters: members go through `memberMatches` and contests through `contestMatches`
+  (`filters.js`), and charts should handle "nothing matches" with an empty state. Filter state lives in the URL hash
+  (`filtersToHash` / `filtersFromHash`), which is untrusted input: validate everything you read from it.
+- The UI has no automated test suite yet. When you change it, exercise it in a browser (including a zero-result query
+  and a phone-width window) and compare filtered counts with the API, for example
+  `OfficeTerm?state=TX&chamber=house&party=R&active-on=...` against the same filters in the UI.
 
 ## Pull requests
 
@@ -52,5 +58,6 @@ Tests that need Postgres use a separate `polstats_test` database and skip if the
 
 ## Reporting security issues
 
-There is no authentication yet and the API is intended for local use. If you find a vulnerability, please open a
+There is no authentication yet. The API is read-only by default (writes need `POLSTATS_ALLOW_WRITES=1`) and is intended
+for local use. If you find a vulnerability, please open a
 private security advisory on the repository rather than a public issue.

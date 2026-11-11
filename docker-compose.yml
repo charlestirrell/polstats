@@ -6,7 +6,8 @@ services:
       POSTGRES_PASSWORD: polstats_dev
       POSTGRES_DB: polstats
     ports:
-      - "5432:5432"
+      # Bound to localhost only: the development password below is public, so never expose this port on a network.
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:

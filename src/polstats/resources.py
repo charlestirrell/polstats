@@ -122,7 +122,8 @@ class Contest(Resource):
     state: Reference  # Location
     district: Reference | None = None  # Location, House only
     special: bool = False
-    totalVotes: int | None = None
+    uncontested: bool = False  # sources store placeholder votes (1 or -1) for these; we keep none
+    totalVotes: int | None = None  # as stated by the source; None when unknown or uncontested
     reporting: str = "official"  # official | unofficial
 
 
@@ -149,7 +150,7 @@ class ContestResult(Resource):
     office: CodeableConcept
     state: Reference
     partyCode: str | None = None
-    votes: int
+    votes: int | None = None  # None for uncontested races (sources only hold a placeholder)
     voteShare: float | None = None  # votes / contest totalVotes, 0..1
     outcome: CodeableConcept | None = None
     outcomeDerived: bool = True

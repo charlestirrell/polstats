@@ -13,19 +13,18 @@
       <h1>polstats data explorer</h1>
       <p class="sub">Verification view over the polstats API. Every number here is fetched from this server's REST endpoints.</p>
     </div>
-    <div class="filters" role="group" aria-label="Filters">
-      <label for="asof">As of</label>
-      <input type="date" id="asof">
-      <button type="button" id="today">Today</button>
+    <div class="top-actions">
       <button type="button" id="theme" aria-label="Switch colour theme">Theme: auto</button>
       <a class="btn-link" href="/docs">API docs</a>
     </div>
   </div>
 </header>
+<nav id="filterbar" class="filterbar" aria-label="Filters"></nav>
 <div id="banner" class="banner" role="alert" hidden></div>
 <main id="main" aria-live="polite"><p class="loading">Loading…</p></main>
 
 <dialog id="detail" aria-labelledby="detail-title"></dialog>
+<script src="filters.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

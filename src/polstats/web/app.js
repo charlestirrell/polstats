@@ -18,8 +18,8 @@ const S = {
   persons: new Map(), locs: new Map(), orgs: new Map(),
   allTerms: [], termsByPerson: new Map(), counts: {},
   asOf: null, active: [], affils: [], rows: [],
-  view: {}, sort: { k: 'name', dir: 1 }, filter: { q: '', chamber: '', group: '', state: '' },
-  elec: null, elecYear: null, elecError: null,
+  view: {}, sort: { k: 'name', dir: 1 }, csort: { k: 'year', dir: -1 }, cLimit: 200, mLimit: 150, fsums: [], checksCache: null, checksOpen: false,
+  elec: null, elecYear: null, elecChamber: 'senate', elecError: null,
 };
 
 /* ---------- tiny DOM helpers ---------- */
@@ -195,8 +195,18 @@ function niceTicks(max) {
 const plotWidth = host => Math.max(280, host.clientWidth || (host.parentElement && host.parentElement.clientWidth - 32) || 560);
 const tipRows = (vals, groups) => groups.filter(g => vals[g.key] > 0).map(g => ({ key: g.key, name: g.name, value: vals[g.key] }));
 
+/* Makes a chart mark behave as a button that applies a filter (mouse, Enter and Space). */
+function makePickable(node, fn) {
+  node.setAttribute('role', 'button');
+  node.setAttribute('aria-label', (node.getAttribute('aria-label') || '') + ' Activate to filter.');
+  node.addEventListener('click', fn);
+  node.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fn(); } });
+}
+const emptyNote = (msg = 'No data matches the current filters.') => el('p', { class: 'muted', text: msg });
+
 /* categories: [{label, vals:{D,R,I,U}}] ; vertical stacked columns */
-function stackedColumns(host, cats, groups, ariaLabel) {
+function stackedColumns(host, cats, groups, ariaLabel, onPick) {
+  if (!cats.length) { host.replaceChildren(emptyNote()); return; }
   const W = plotWidth(host), H = 240, m = { l: 34, r: 8, t: 10, b: 26 };
   const iw = W - m.l - m.r, ih = H - m.t - m.b;
   const totals = cats.map(c => groups.reduce((s, g) => s + (c.vals[g.key] || 0), 0));
@@ -226,13 +236,15 @@ function stackedColumns(host, cats, groups, ariaLabel) {
     const hit = sv('rect', { x: m.l + slot * i, y: m.t, width: slot, height: ih, fill: 'transparent', tabindex: 0,
       'aria-label': `${c.label}: ${total} total. ${rows.map(r => `${r.name} ${r.value}`).join(', ')}` });
     bindTip(hit, col, `${c.label} (${total} total)`, rows);
+    if (onPick) makePickable(hit, () => onPick(c));
     svgEl.append(hit);
   });
   host.replaceChildren(svgEl);
 }
 
 /* horizontal stacked bars with the row total at the tip */
-function stackedBars(host, cats, groups, ariaLabel) {
+function stackedBars(host, cats, groups, ariaLabel, onPick) {
+  if (!cats.length) { host.replaceChildren(emptyNote()); return; }
   const W = plotWidth(host), rowH = 26, barH = 16, m = { l: 118, r: 40, t: 4, b: 22 };
   const H = m.t + m.b + cats.length * rowH, iw = W - m.l - m.r;
   const totals = cats.map(c => groups.reduce((s, g) => s + (c.vals[g.key] || 0), 0));
@@ -260,13 +272,14 @@ function stackedBars(host, cats, groups, ariaLabel) {
     const hit = sv('rect', { x: 0, y: m.t + i * rowH, width: W, height: rowH, fill: 'transparent', tabindex: 0,
       'aria-label': `${c.label}: ${totals[i]} total. ${rows.map(r => `${r.name} ${r.value}`).join(', ')}` });
     bindTip(hit, col, `${c.label} (${totals[i]} total)`, rows);
+    if (onPick) makePickable(hit, () => onPick(c));
     svgEl.append(hit);
   });
   host.replaceChildren(svgEl);
 }
 
 /* tall segmented bar (one whole split into <= 4 parts) */
-function segmentedBar(title, counts, groups) {
+function segmentedBar(title, counts, groups, opts = {}) {
   const total = groups.reduce((s, g) => s + (counts[g.key] || 0), 0);
   const present = groups.filter(g => counts[g.key] > 0);
   const label = `${title}: ${present.map(g => `${g.name} ${counts[g.key]}`).join(', ')}`;
@@ -276,9 +289,13 @@ function segmentedBar(title, counts, groups) {
     const part = el('div', { class: 'seg-part', tabindex: 0, style: `flex:${counts[g.key]} 1 0;background:var(--c-${g.key})`, 'aria-label': `${g.name}: ${counts[g.key]} (${pct}%)` });
     part.dataset.label = String(counts[g.key]);
     bindTip(part, part, title, [{ key: g.key, name: `${g.name} (${pct}%)`, value: counts[g.key] }]);
+    if (opts.onPart) makePickable(part, () => opts.onPart(g));
     bar.append(part);
   }
-  const node = el('div', { class: 'seg-row' }, el('div', { class: 'seg-row-head' }, el('span', { text: title }), el('span', { text: `${total} total` })), bar);
+  const head = el('div', { class: 'seg-row-head' },
+    opts.onTitle ? el('button', { type: 'button', text: title, title: 'Filter to this chamber', onclick: opts.onTitle }) : el('span', { text: title }),
+    el('span', { text: `${total} total` }));
+  const node = el('div', { class: 'seg-row' }, head, bar);
   node._afterAttach = () => { for (const p of bar.children) if (p.offsetWidth >= 40) p.textContent = p.dataset.label; };
   return node;
 }
@@ -294,7 +311,7 @@ function tableEl(cols, rows) {
     el('tbody', {}, rows.map(r => el('tr', {}, r.map((v, i) => el('td', { class: cols[i].num ? 'num' : '', text: String(v) }))))));
 }
 /* card with Chart/Table twin toggle. draw(host) renders the chart once the card is in the DOM. */
-function card(id, title, sub, legendEl, draw, table) {
+function card(id, title, sub, legendEl, draw, table, scope) {
   const plot = el('div', { class: 'plot' }), tbl = el('div', { class: 'tablewrap', hidden: '' }, table);
   const bC = el('button', { type: 'button', text: 'Chart' }), bT = el('button', { type: 'button', text: 'Table' });
   const set = v => {
@@ -303,7 +320,7 @@ function card(id, title, sub, legendEl, draw, table) {
   };
   bC.onclick = () => set('chart'); bT.onclick = () => set('table');
   const node = el('section', { class: 'card' },
-    el('div', { class: 'card-head' }, el('div', {}, el('h2', { text: title }), el('p', { class: 'card-sub', text: sub })),
+    el('div', { class: 'card-head' }, el('div', {}, el('h2', { text: title }), el('p', { class: 'card-sub', text: sub }), scope ? el('p', { class: 'scope-line', text: scope }) : null),
       el('div', { class: 'seg-toggle', role: 'group', 'aria-label': `${title} view` }, bC, bT)),
     legendEl, plot, tbl);
   set(S.view[id] || 'chart');
@@ -311,6 +328,9 @@ function card(id, title, sub, legendEl, draw, table) {
 }
 
 /* ---------- sections ---------- */
+const memberScope = rows => (memberFiltersActive() ? `Filtered: ${fmt(rows.length)} of ${fmt(S.rows.length)} members.` : null);
+const contestScope = () => (contestFiltersActive() && S.elec ? `Filtered: ${fmt(S.fsums.length)} of ${fmt(contestSummaries().length)} contests.` : null);
+const setChamber = ch => { F.chambers = F.chambers.size === 1 && F.chambers.has(ch) ? new Set() : new Set([ch]); filterChanged(); };
 const groupsIn = rows => GROUPS.filter(g => g.key !== 'U' || rows.some(r => r.group === 'U'));
 const histogram = (rows, value, lo, step, hiLabelFrom, count) => {
   const cats = [];
@@ -330,15 +350,16 @@ const catTable = (cats, groups, first) => tableEl(
   cats.map(c => [c.label, ...groups.map(g => c.vals[g.key] || 0), groups.reduce((s, g) => s + (c.vals[g.key] || 0), 0)]));
 
 function tilesSection(rows) {
+  const filtered = memberFiltersActive(), all = S.rows;
   const sen = rows.filter(r => r.chamber === 'senate'), rep = rows.filter(r => r.office === 'representative');
   const nonvoting = rows.filter(r => r.chamber === 'house' && r.office !== 'representative');
   const tile = (label, value, sub) => el('div', { class: 'tile' }, el('div', { class: 'tile-label', text: label }),
     el('div', { class: 'tile-value', text: value }), sub ? el('div', { class: 'tile-sub', text: sub }) : null);
   const ma = median(rows.map(r => r.age)), mt = median(rows.map(r => r.tenure));
   return el('div', { class: 'tiles' },
-    tile('Members', fmt(rows.length), `as of ${S.asOf}`),
-    tile('Senators', fmt(sen.length), 'of 100 seats'),
-    tile('House voting members', fmt(rep.length), 'of 435 seats'),
+    tile('Members', fmt(rows.length), filtered ? `of ${fmt(all.length)} · as of ${S.asOf}` : `as of ${S.asOf}`),
+    tile('Senators', fmt(sen.length), filtered ? `of ${fmt(all.filter(r => r.chamber === 'senate').length)} seated` : 'of 100 seats'),
+    tile('House voting members', fmt(rep.length), filtered ? `of ${fmt(all.filter(r => r.office === 'representative').length)} seated` : 'of 435 seats'),
     tile('Delegates / commissioner', fmt(nonvoting.length), 'non-voting'),
     tile('Median age', ma == null ? '–' : ma.toFixed(0), 'years'),
     tile('Median time since first term', mt == null ? '–' : mt.toFixed(1), 'years (first term start)'));
@@ -348,50 +369,59 @@ function compositionCard(rows) {
   const groups = groupsIn(rows);
   const sen = countBy(rows.filter(r => r.chamber === 'senate'), r => r.group);
   const rep = countBy(rows.filter(r => r.office === 'representative'), r => r.group);
-  const sBar = segmentedBar('Senate', sen, groups), hBar = segmentedBar('House (voting members)', rep, groups);
+  const pickParty = g => toggleIn(F.groups, g.key);
+  const sBar = segmentedBar('Senate', sen, groups, { onPart: pickParty, onTitle: () => setChamber('senate') });
+  const hBar = segmentedBar('House (voting members)', rep, groups, { onPart: pickParty, onTitle: () => setChamber('house') });
   const nodes = [sBar, hBar];
   const table = tableEl([{ h: 'Chamber' }, ...groups.map(g => ({ h: g.name, num: 1 })), { h: 'Total', num: 1 }],
     [['Senate', sen], ['House (voting)', rep]].map(([n, c]) => [n, ...groups.map(g => c[g.key] || 0), groups.reduce((s, g) => s + (c[g.key] || 0), 0)]));
-  const c = card('comp', 'Chamber composition', 'Party of each member on the selected date. Independents are shown separately.', legend(groups),
-    host => { host.replaceChildren(...nodes); nodes.forEach(n => n._afterAttach && n._afterAttach()); }, table);
+  const c = card('comp', 'Chamber composition', 'Party of each member on the selected date. Click a segment to filter by party, or a chamber name to filter by chamber.', legend(groups),
+    host => { host.replaceChildren(...nodes); nodes.forEach(n => n._afterAttach && n._afterAttach()); }, table, memberScope(rows));
   return c;
 }
 
 function stateCard(rows) {
   const groups = groupsIn(rows), byState = new Map();
   for (const r of rows) {
-    if (!byState.has(r.stateName)) byState.set(r.stateName, { label: r.stateName, vals: { D: 0, R: 0, I: 0, U: 0 } });
+    if (!byState.has(r.stateName)) byState.set(r.stateName, { label: r.stateName, key: r.state, vals: { D: 0, R: 0, I: 0, U: 0 } });
     byState.get(r.stateName).vals[r.group]++;
   }
   const all = [...byState.values()].map(c => ({ ...c, total: groups.reduce((s, g) => s + c.vals[g.key], 0) }))
     .sort((a, b) => b.total - a.total || a.label.localeCompare(b.label));
   const top = all.slice(0, 15);
-  return card('state', 'Delegation size by state', `Top 15 of ${all.length} states and territories by seats held (House + Senate). Table view lists all.`,
-    legend(groups), host => stackedBars(host, top, groups, 'Stacked bars: seats by state and party'),
-    catTable(all, groups, 'State / territory'));
+  return card('state', 'Delegation size by state', `Top 15 of ${all.length} states and territories by seats held (House + Senate). Click a bar to filter by state. Table view lists all.`,
+    legend(groups), host => stackedBars(host, top, groups, 'Stacked bars: seats by state and party', c => toggleIn(F.states, c.key)),
+    catTable(all, groups, 'State / territory'), memberScope(rows));
 }
 
 function ageCard(rows) {
   const groups = groupsIn(rows), cats = histogram(rows, r => r.age, 25, 5, null, 14);
-  return card('age', 'Age distribution', 'Members by age on the selected date, 5-year bins, stacked by party.', legend(groups),
-    host => stackedColumns(host, cats, groups, 'Stacked columns: members by age band and party'), catTable(cats, groups, 'Age'));
+  cats.forEach((c, i) => { c.lo = 25 + i * 5; c.hi = i === cats.length - 1 ? Math.max(c.lo, BOUNDS.age[1]) : c.lo + 4; });
+  return card('age', 'Age distribution', 'Members by age on the selected date, 5-year bins, stacked by party. Click a bar to filter by age.', legend(groups),
+    host => stackedColumns(host, cats, groups, 'Stacked columns: members by age band and party', c => pickRange('age', [c.lo, c.hi])),
+    catTable(cats, groups, 'Age'), memberScope(rows));
 }
 function tenureCard(rows) {
   const groups = groupsIn(rows), cats = histogram(rows, r => r.tenure, 0, 4, null, 11);
-  return card('tenure', 'Years since first term began', 'Time since the start of the member\'s earliest recorded term (not continuous service), 4-year bins.', legend(groups),
-    host => stackedColumns(host, cats, groups, 'Stacked columns: members by years since first term and party'), catTable(cats, groups, 'Years'));
+  cats.forEach((c, i) => { c.lo = i * 4; c.hi = i === cats.length - 1 ? Math.max(c.lo, BOUNDS.tenure[1]) : c.lo + 4; });
+  return card('tenure', 'Years since first term began', 'Time since the start of the member\'s earliest recorded term (not continuous service), 4-year bins. Click a bar to filter.', legend(groups),
+    host => stackedColumns(host, cats, groups, 'Stacked columns: members by years since first term and party', c => pickRange('tenure', [c.lo, c.hi])),
+    catTable(cats, groups, 'Years'), memberScope(rows));
 }
 
 /* ---------- elections ---------- */
 const PARTY_NAME = { D: 'Democratic', R: 'Republican', I: 'Independent', L: 'Libertarian', G: 'Green', other: 'Other' };
-const BUCKET = /^(|OTHER|OTHERS|SCATTERING|WRITE-IN|\(WRITE-IN, AGGREGATED\)|\(UNNAMED\))$/;
+/* catch-all rows that are not people (mirrors BUCKET_RX in loaders/medsl.py) */
+const BUCKET_RX = /^(WRITE ?IN|OTHERS?|ALL OTHERS|SCATTER(ING)?|BLANKS?|VOID|SPOILED|UNDER ?VOTES?|OVER ?VOTES?|NONE OF THE ABOVE|NONE OF THESE|MISCELLANEOUS|EXHAUSTED( BALLOTS?)?|UNNAMED)( |$)/;
+const BUCKET_EXACT = new Set(['INDEPENDENT', 'WORKING FAMILIES', 'MODERATE', 'NO NAME']);
+const isBucket = name => { const n = String(name).toUpperCase().replace(/[^A-Z0-9]+/g, ' ').trim(); return !n || BUCKET_EXACT.has(n) || BUCKET_RX.test(n); };
 const leftRounded = (x, y, w, h, r) => { r = Math.min(r, h / 2, w);
   return `M${x + w},${y}H${x + r}Q${x},${y} ${x},${y + r}V${y + h - r}Q${x},${y + h} ${x + r},${y + h}H${x + w}Z`; };
 const pct = v => (v * 100).toFixed(1) + '%';
 const signed = v => (v > 0 ? '+' : v < 0 ? '−' : '') + Math.abs(v).toFixed(1);
 
 /* one summary per contest, derived from the API's Contest + ContestResult + Candidacy resources */
-function contestSummaries() {
+function buildContestSummaries() {
   const E = S.elec, out = [];
   for (const c of E.contests.values()) {
     const el_ = E.elections.get(refId(c.election.reference));
@@ -400,14 +430,14 @@ function contestSummaries() {
     const rs = (E.byContest.get(c.id) || []).map(r => {
       const cand = E.cands.get(refId(r.candidacy.reference)) || { name: '?' };
       return { r, cand, name: cand.name, votes: r.votes, share: r.voteShare, party: r.partyCode || 'other', outcome: code(r.outcome) };
-    }).sort((a, b) => b.votes - a.votes);
-    const named = rs.filter(x => !BUCKET.test(x.name.toUpperCase()));
+    }).sort((a, b) => (b.votes || 0) - (a.votes || 0));
+    const named = rs.filter(x => !isBucket(x.name));
     const topOf = p => named.find(x => x.party === p);
     const d = topOf('D'), rep = topOf('R');
     out.push({
       id: c.id, year: el_ ? el_.year : 0, kind: el_ ? code(el_.kind) : '', special: !!c.special, office: code(c.office),
       state: st ? identVal(st, SYS_USPS) || st.name : '?', stateName: st ? st.name : '?', district: dist ? dist.name : '',
-      total: c.totalVotes, reporting: c.reporting, results: rs, named,
+      total: c.totalVotes, uncontested: !!c.uncontested, reporting: c.reporting, results: rs, named,
       winner: rs.find(x => x.outcome === 'won') || null, advanced: rs.filter(x => x.outcome === 'advanced-to-runoff'),
       margin: d && rep && d.share != null && rep.share != null ? (d.share - rep.share) * 100 : null, d, rep,
     });
@@ -435,54 +465,102 @@ function divergingBars(host, items, ariaLabel) {
     svgEl.append(sv('text', { x: pos ? x(it.value) + 6 : x(it.value) - 6, y: cy + barH - 3, 'text-anchor': pos ? 'start' : 'end', class: 'vlabel' }, document.createTextNode(signed(it.value))));
     const hit = sv('rect', { x: 0, y: m.t + i * rowH, width: W, height: rowH, fill: 'transparent', tabindex: 0, 'aria-label': it.aria });
     bindTip(hit, col, it.label, it.tip);
+    if (it.pick) makePickable(hit, it.pick);
     svgEl.append(hit);
   });
   host.replaceChildren(svgEl);
 }
 
+let _sums = null, _sumsFor = null;
+function contestSummaries() {
+  if (_sumsFor !== S.elec) { _sums = buildContestSummaries(); _sumsFor = S.elec; }
+  return _sums;
+}
+const chamberOf = c => (c.office === 'senator' ? 'senate' : 'house');
+const CHAMBER_LABEL = { senate: 'Senate', house: 'House' };
+
+/* Decide which chamber the election charts show, once per render and BEFORE any card reads it. */
+function resolveElecChamber() {
+  const present = ['senate', 'house'].filter(ch => S.fsums.some(c => chamberOf(c) === ch));
+  if (present.length && !present.includes(S.elecChamber)) S.elecChamber = present[0];
+  if (!present.length && F.chambers.size === 1) S.elecChamber = [...F.chambers][0];   // nothing matches: still follow the filter
+  return present;
+}
+function chamberControl() {
+  const present = ['senate', 'house'].filter(ch => S.fsums.some(c => chamberOf(c) === ch));
+  if (present.length < 2) return null;
+  const sel = el('select', { 'aria-label': 'Chamber', onchange: e => { S.elecChamber = e.target.value; S.elecYear = null; render(); } },
+    present.map(ch => el('option', { value: ch, text: CHAMBER_LABEL[ch] })));
+  sel.value = S.elecChamber;
+  return el('span', { class: 'control' }, el('label', { text: 'Chamber' }), sel);
+}
+
 function elecYears() {
-  return [...new Set(contestSummaries().filter(c => c.winner || c.advanced.length).map(c => c.year))].sort((a, b) => a - b);
+  return [...new Set(S.fsums.filter(c => chamberOf(c) === S.elecChamber && (c.winner || c.advanced.length)).map(c => c.year))]
+    .sort((a, b) => a - b);
 }
 
 function seatsWonCard() {
-  const sums = contestSummaries().filter(c => c.winner);
+  const ch = S.elecChamber;
+  const sums = S.fsums.filter(c => c.winner && chamberOf(c) === ch && (c.office === 'senator' || c.office === 'representative'));
   const years = [...new Set(sums.map(c => c.year))].sort((a, b) => a - b);
   const groups = GROUPS.filter(g => g.key !== 'U');
   const cats = years.map(y => ({ label: String(y), vals: { D: 0, R: 0, I: 0, U: 0 } }));
   for (const c of sums) cats[years.indexOf(c.year)].vals[groupOf(c.winner.party)]++;
-  const office = [...new Set(sums.map(c => c.office))].map(o => (o === 'senator' ? 'Senate' : 'House')).join(' + ');
-  return card('seatswon', `${office} seats won, by party and election year`,
-    'Regular, special and runoff elections in the data. Winners are derived (plurality; runoff pairs excluded).', legend(groups),
-    host => stackedColumns(host, cats, groups, 'Stacked columns: seats won per election year by party'), catTable(cats, groups, 'Year'));
+  const controls = el('div', { class: 'members-controls' }, chamberControl(), legend(groups));
+  return card('seatswon', `${CHAMBER_LABEL[ch]} seats won, by party and election year`,
+    ch === 'house'
+      ? 'Voting seats in regular, special and runoff elections (DC delegate excluded). Winners are derived (plurality; runoff pairs excluded). Click a bar to filter to that year.'
+      : 'Regular, special and runoff elections in the data. Winners are derived (plurality; runoff pairs excluded). Click a bar to filter to that year.',
+    controls, host => stackedColumns(host, cats, groups, `Stacked columns: ${CHAMBER_LABEL[ch]} seats won per election year by party`,
+      c => pickRange('years', [Number(c.label), Number(c.label)])),
+    catTable(cats, groups, 'Year'), contestScope());
 }
 
 function marginsCard() {
-  const years = elecYears();
+  const ch = S.elecChamber, years = elecYears();
+  if (!years.length) return card('margins', 'Election margins', 'No contests with a winner match the current filters.', null, host => host.replaceChildren(emptyNote()), tableEl([{ h: 'Contest' }], []), contestScope());
   if (!S.elecYear || !years.includes(S.elecYear)) S.elecYear = years[years.length - 1];
-  const sums = contestSummaries().filter(c => c.year === S.elecYear)
-    .sort((a, b) => a.stateName.localeCompare(b.stateName) || a.kind.localeCompare(b.kind));
-  const tag = c => (c.kind === 'runoff' ? ' (runoff)' : c.special ? ' (special)' : '') + (c.office === 'representative' ? ` ${c.district.replace(/^[A-Z]{2}-/, '')}` : '');
-  const items = sums.filter(c => c.margin != null)
-    .sort((a, b) => a.margin - b.margin)
-    .map(c => ({
-      label: c.stateName + tag(c), value: c.margin,
+  const sums = S.fsums.filter(c => c.year === S.elecYear && chamberOf(c) === ch)
+    .sort((a, b) => a.stateName.localeCompare(b.stateName) || String(a.district).localeCompare(String(b.district), undefined, { numeric: true }) || a.kind.localeCompare(b.kind));
+  const tag = c => (c.kind === 'runoff' ? ' (runoff)' : c.special ? ' (special)' : '') + (ch === 'house' ? ` ${c.district.replace(/^[A-Z]{2}-/, '')}` : '');
+  const measured = sums.filter(c => c.margin != null);
+  const select = el('select', { 'aria-label': 'Election year', onchange: e => { S.elecYear = Number(e.target.value); render(); } },
+    years.slice().reverse().map(y => el('option', { value: y, text: String(y), selected: y === S.elecYear ? '' : null })));
+  const key = el('ul', { class: 'legend', 'aria-label': 'Legend' },
+    el('li', {}, el('span', { class: 'swatch', style: 'background:var(--c-R)' }), 'Republican lead'),
+    el('li', {}, el('span', { class: 'swatch', style: 'background:var(--c-D)' }), 'Democratic lead'));
+  const lg = el('div', { class: 'members-controls' }, chamberControl(), el('span', { class: 'control' }, el('label', { text: 'Election year' }), select), key);
+
+  const rows = sums.map(c => [c.stateName + tag(c), c.kind + (c.special && c.kind !== 'special' ? ' (special)' : ''),
+    c.winner ? c.winner.name : (c.advanced.length ? 'Runoff: ' + c.advanced.map(a => a.name).join(' / ') : '—'),
+    c.winner ? PARTY_NAME[c.winner.party] || c.winner.party : '', c.winner && c.winner.share != null ? pct(c.winner.share) : (c.uncontested ? 'uncontested' : ''),
+    c.margin == null ? 'n/a' : signed(c.margin), c.total == null ? '' : fmt(c.total), c.winner && c.winner.cand.person ? 'yes' : '']);
+  const table = tableEl([{ h: 'Contest' }, { h: 'Kind' }, { h: 'Winner' }, { h: 'Party' }, { h: 'Share', num: 1 }, { h: 'Margin D−R (pts)', num: 1 }, { h: 'Total votes', num: 1 }, { h: 'Linked to a person' }], rows);
+
+  if (ch === 'senate') {
+    const items = measured.sort((a, b) => a.margin - b.margin).map(c => ({
+      label: c.stateName + tag(c), value: c.margin, pick: () => toggleIn(F.states, c.state),
       aria: `${c.stateName}: ${c.d.name} ${pct(c.d.share)}, ${c.rep.name} ${pct(c.rep.share)}`,
       tip: [{ key: 'D', name: c.d.name, value: pct(c.d.share) }, { key: 'R', name: c.rep.name, value: pct(c.rep.share) }],
     }));
-  const select = el('select', { 'aria-label': 'Election year', onchange: e => { S.elecYear = Number(e.target.value); render(); } },
-    years.slice().reverse().map(y => el('option', { value: y, text: String(y), selected: y === S.elecYear ? '' : null })));
-  const lg = el('div', { class: 'members-controls' }, el('label', { text: 'Election year' }), select,
-    el('ul', { class: 'legend', 'aria-label': 'Legend' },
-      el('li', {}, el('span', { class: 'swatch', style: 'background:var(--c-R)' }), 'Republican lead'),
-      el('li', {}, el('span', { class: 'swatch', style: 'background:var(--c-D)' }), 'Democratic lead')));
-  const rows = sums.map(c => [c.stateName + tag(c), c.kind + (c.special && c.kind !== 'special' ? ' (special)' : ''),
-    c.winner ? c.winner.name : (c.advanced.length ? 'Runoff: ' + c.advanced.map(a => a.name).join(' / ') : '—'),
-    c.winner ? PARTY_NAME[c.winner.party] || c.winner.party : '', c.winner && c.winner.share != null ? pct(c.winner.share) : '',
-    c.margin == null ? 'n/a' : signed(c.margin), c.total == null ? '' : fmt(c.total), c.winner && c.winner.cand.person ? 'yes' : '']);
-  return card('margins', `${S.elecYear} contests: two-party vote margin`,
-    'Democratic share minus Republican share, in percentage points (top candidate of each party). Table lists every contest incl. winner and uncontested races.',
-    lg, host => items.length ? divergingBars(host, items, `Diverging bars: ${S.elecYear} margins by contest`) : host.replaceChildren(el('p', { class: 'muted', text: 'No contests with both a Democratic and a Republican candidate.' })),
-    tableEl([{ h: 'Contest' }, { h: 'Kind' }, { h: 'Winner' }, { h: 'Party' }, { h: 'Share', num: 1 }, { h: 'Margin D−R (pts)', num: 1 }, { h: 'Total votes', num: 1 }, { h: 'Linked to a person' }], rows));
+    return card('margins', `${S.elecYear} contests: two-party vote margin`,
+      'Democratic share minus Republican share, in percentage points (top candidate of each party). Click a bar to filter by state. Table lists every contest incl. winner and uncontested races.',
+      lg, host => items.length ? divergingBars(host, items, `Diverging bars: ${S.elecYear} margins by contest`) : host.replaceChildren(el('p', { class: 'muted', text: 'No contests with both a Democratic and a Republican candidate.' })), table, contestScope());
+  }
+
+  // House: 435 districts are too many for one bar each, so show how many districts fall in each margin band.
+  const cats = [];
+  for (let lo = -100; lo < 100; lo += 10) cats.push({ label: lo >= 0 ? `+${lo}` : `−${-lo}`, lo, vals: { D: 0, R: 0, I: 0, U: 0 } });
+  for (const c of measured) {
+    const i = Math.min(cats.length - 1, Math.max(0, Math.floor((c.margin + 100) / 10)));
+    cats[i].vals[c.margin >= 0 ? 'D' : 'R']++;
+  }
+  const groups = GROUPS.filter(g => g.key === 'D' || g.key === 'R');
+  const unmeasured = sums.length - measured.length;
+  return card('margins', `${S.elecYear} House districts by two-party margin`,
+    `Number of districts in each 10-point band of Democratic minus Republican share (band shown by its lower edge). Click a bar to filter by margin. ${fmt(unmeasured)} contest(s) without both a Democratic and a Republican candidate or without vote counts are only in the table.`,
+    lg, host => stackedColumns(host, cats, groups, `Columns: ${S.elecYear} House districts by margin band`, c => pickRange('margin', [c.lo, c.lo + 10])), table, contestScope());
 }
 
 function electionsSection() {
@@ -490,6 +568,7 @@ function electionsSection() {
   if (!S.elec) return [el('section', { class: 'card' }, el('h2', { text: 'Election results' }), el('p', { class: 'card-sub', text: 'Loading election results…' }))];
   if (!S.elec.contests.size) return [el('section', { class: 'card' }, el('h2', { text: 'Election results' }),
     el('p', { class: 'card-sub', text: 'No election data loaded yet. Run the MEDSL loader (see README).' }))];
+  resolveElecChamber();
   return [seatsWonCard(), marginsCard()];
 }
 
@@ -499,32 +578,21 @@ const COLS = [
   { k: 'partyName', h: 'Party' }, { k: 'age', h: 'Age', num: 1 }, { k: 'firstStart', h: 'First term began' }, { k: 'bioguide', h: 'Bioguide' },
 ];
 function membersCard(rows) {
-  const f = S.filter;
-  const states = [...new Set(rows.map(r => r.state))].sort();
-  const search = el('input', { type: 'search', placeholder: 'Search name or state', 'aria-label': 'Search members', value: f.q });
-  const selChamber = el('select', { 'aria-label': 'Chamber' }, el('option', { value: '', text: 'All chambers' }), el('option', { value: 'senate', text: 'Senate' }), el('option', { value: 'house', text: 'House' }));
-  const selGroup = el('select', { 'aria-label': 'Party' }, el('option', { value: '', text: 'All parties' }), groupsIn(rows).map(g => el('option', { value: g.key, text: g.name })));
-  const selState = el('select', { 'aria-label': 'State' }, el('option', { value: '', text: 'All states' }), states.map(s => el('option', { value: s, text: s })));
-  selChamber.value = f.chamber; selGroup.value = f.group; selState.value = f.state;
-  const count = el('span', { class: 'count' });
-  const wrap = el('div', { class: 'tablewrap members-wrap' });
-
+  const count = el('span', { class: 'count' }), wrap = el('div', { class: 'tablewrap members-wrap' }), moreRow = el('div', { class: 'more-row' });
   function paint() {
-    const q = f.q.trim().toLowerCase();
-    let list = rows.filter(r => (!f.chamber || r.chamber === f.chamber) && (!f.group || r.group === f.group) && (!f.state || r.state === f.state)
-      && (!q || r.name.toLowerCase().includes(q) || r.state.toLowerCase() === q || r.stateName.toLowerCase().includes(q)));
     const { k, dir } = S.sort;
-    list = list.slice().sort((a, b) => {
+    const list = rows.slice().sort((a, b) => {
       const x = a[k], y = b[k];
       if (x === y) return a.name.localeCompare(b.name);
       if (x == null || x === '') return 1;
       if (y == null || y === '') return -1;
       return (typeof x === 'number' ? x - y : String(x).localeCompare(String(y))) * dir;
     });
-    count.textContent = `${fmt(list.length)} of ${fmt(rows.length)} members`;
+    count.textContent = `${fmt(list.length)} of ${fmt(S.rows.length)} members`;
     const head = el('tr', {}, COLS.map(c => el('th', { scope: 'col', class: c.num ? 'num' : '', 'aria-sort': S.sort.k === c.k ? (S.sort.dir > 0 ? 'ascending' : 'descending') : 'none' },
       el('button', { type: 'button', text: c.h + (S.sort.k === c.k ? (S.sort.dir > 0 ? ' ▲' : ' ▼') : ''), onclick: () => { S.sort = { k: c.k, dir: S.sort.k === c.k ? -S.sort.dir : 1 }; paint(); } }))));
-    const body = list.map(r => {
+    const shown = list.slice(0, S.mLimit);
+    const body = shown.map(r => {
       const tr = el('tr', { class: 'clickable', tabindex: 0, 'aria-label': `Open details for ${r.name}` },
         el('td', { text: r.name }), el('td', { text: r.chamber }), el('td', { text: r.state }), el('td', { text: r.district }),
         el('td', {}, el('span', { class: 'dot', style: `background:var(--c-${r.group})` }), r.partyName || '—'),
@@ -533,16 +601,106 @@ function membersCard(rows) {
       tr.onkeydown = e => { if (e.key === 'Enter') openDetail(r); };
       return tr;
     });
-    wrap.replaceChildren(el('table', {}, el('thead', {}, head), el('tbody', {}, body)));
+    wrap.replaceChildren(list.length ? el('table', {}, el('thead', {}, head), el('tbody', {}, body)) : emptyNote('No members match the current filters.'));
+    const left = list.length - shown.length;
+    moreRow.replaceChildren(...(left > 0 ? [el('span', { text: `Showing ${fmt(shown.length)} of ${fmt(list.length)}.` }),
+      el('button', { type: 'button', text: `Show ${fmt(Math.min(150, left))} more`, onclick: () => { S.mLimit += 150; paint(); } }),
+      left > 150 ? el('button', { type: 'button', text: `Show all ${fmt(list.length)}`, onclick: () => { S.mLimit = list.length; paint(); } }) : null] : []));
   }
-  search.oninput = () => { f.q = search.value; paint(); };
-  selChamber.onchange = () => { f.chamber = selChamber.value; paint(); };
-  selGroup.onchange = () => { f.group = selGroup.value; paint(); };
-  selState.onchange = () => { f.state = selState.value; paint(); };
   paint();
   return el('section', { class: 'card' },
-    el('div', { class: 'card-head' }, el('div', {}, el('h2', { text: 'Members' }), el('p', { class: 'card-sub', text: 'Everyone holding a seat on the selected date. Select a row for full records.' }))),
-    el('div', { class: 'members-controls' }, search, selChamber, selGroup, selState, count), wrap);
+    el('div', { class: 'card-head' }, el('div', {}, el('h2', { text: 'Members' }),
+      el('p', { class: 'card-sub', text: 'Everyone holding a seat on the selected date who matches the filters above. Select a row for full records.' }))),
+    el('div', { class: 'members-controls' }, count), wrap, moreRow);
+}
+
+/* ---------- contests explorer: every contest that matches the filters ---------- */
+const CCOLS = [
+  { k: 'year', h: 'Year', num: 1 }, { k: 'chamber', h: 'Chamber' }, { k: 'where', h: 'Contest' }, { k: 'kind', h: 'Kind' },
+  { k: 'winnerName', h: 'Winner' }, { k: 'winnerParty', h: 'Party' }, { k: 'share', h: 'Share', num: 1 },
+  { k: 'margin', h: 'Margin D−R', num: 1 }, { k: 'total', h: 'Total votes', num: 1 }, { k: 'linked', h: 'Member' },
+];
+const padNum = n => String(n).padStart(4, '0');
+function contestRow(c) {
+  if (c._row) return c._row;
+  const distNum = c.district ? c.district.replace(/^[A-Z]{2}-/, '') : '';
+  return c._row = {
+    c, year: c.year, chamber: chamberOf(c),
+    wk: c.stateName.toLowerCase() + ' ' + (distNum === 'AL' ? '0000' : /^\d+$/.test(distNum) ? padNum(distNum) : distNum) + ' ' + c.kind,
+    where: c.stateName + (c.district ? ' ' + c.district.replace(/^[A-Z]{2}-/, '') : ''),
+    kind: c.kind + (c.special && c.kind !== 'special' ? ' (special)' : ''),
+    winnerName: c.winner ? c.winner.name : (c.advanced.length ? 'Runoff: ' + c.advanced.map(a => a.name).join(' / ') : ''),
+    winnerParty: c.winner ? (PARTY_NAME[c.winner.party] || c.winner.party) : '',
+    share: c.winner && c.winner.share != null ? c.winner.share : null, margin: c.margin, total: c.total,
+    linked: c.winner && c.winner.cand.person ? 'yes' : '',
+  };
+}
+function contestsCard() {
+  if (!S.elec || !S.elec.contests.size) return null;
+  const rows = S.fsums.map(contestRow);
+  const count = el('span', { class: 'count' }), wrap = el('div', { class: 'tablewrap members-wrap' }), moreRow = el('div', { class: 'more-row' });
+  let sortedFor = null, sorted = null;
+  function paint() {
+    const { k, dir } = S.csort;
+    if (sortedFor !== k + dir) {   // paging must not re-sort
+      const key = k === 'where' ? 'wk' : k;
+      sorted = rows.slice().sort((a, b) => {
+        const x = a[key], y = b[key];
+        if (x == null || x === '') return (y == null || y === '') ? (a.wk < b.wk ? -1 : 1) : 1;
+        if (y == null || y === '') return -1;
+        return (x < y ? -1 : x > y ? 1 : (a.wk < b.wk ? -1 : a.wk > b.wk ? 1 : 0)) * dir;
+      });
+      sortedFor = k + dir;
+    }
+    const shown = sorted.slice(0, S.cLimit);
+    count.textContent = `${fmt(rows.length)} contests match`;
+    const head = el('tr', {}, CCOLS.map(c => el('th', { scope: 'col', class: c.num ? 'num' : '', 'aria-sort': S.csort.k === c.k ? (S.csort.dir > 0 ? 'ascending' : 'descending') : 'none' },
+      el('button', { type: 'button', text: c.h + (S.csort.k === c.k ? (S.csort.dir > 0 ? ' ▲' : ' ▼') : ''), onclick: () => { S.csort = { k: c.k, dir: S.csort.k === c.k ? -S.csort.dir : (c.num ? -1 : 1) }; paint(); } }))));
+    const body = shown.map(r => {
+      const tr = el('tr', { class: 'clickable', tabindex: 0, 'aria-label': `Open details for ${r.year} ${r.where}` },
+        el('td', { class: 'num', text: String(r.year) }), el('td', { text: r.chamber }), el('td', { text: r.where }), el('td', { text: r.kind }),
+        el('td', { text: r.winnerName }),
+        el('td', {}, r.c.winner ? el('span', { class: 'dot', style: `background:var(--c-${groupOf(r.c.winner.party)})` }) : null, r.winnerParty),
+        el('td', { class: 'num', text: r.share != null ? pct(r.share) : (r.c.uncontested ? 'uncontested' : '') }),
+        el('td', { class: 'num', text: r.margin == null ? '' : signed(r.margin) }),
+        el('td', { class: 'num', text: r.total == null ? '' : fmt(r.total) }), el('td', { text: r.linked }));
+      tr.onclick = () => openContest(r.c);
+      tr.onkeydown = e => { if (e.key === 'Enter') openContest(r.c); };
+      return tr;
+    });
+    wrap.replaceChildren(rows.length ? el('table', {}, el('thead', {}, head), el('tbody', {}, body)) : emptyNote('No contests match the current filters.'));
+    const left = rows.length - shown.length;
+    moreRow.replaceChildren(...(rows.length ? [el('span', { text: `Showing ${fmt(shown.length)} of ${fmt(rows.length)}.` }),
+      left > 0 ? el('button', { type: 'button', text: `Show ${fmt(Math.min(200, left))} more`, onclick: () => { S.cLimit += 200; paint(); } }) : null,
+      left > 200 ? el('button', { type: 'button', text: `Show all ${fmt(rows.length)}`, onclick: () => { S.cLimit = rows.length; paint(); } }) : null] : []));
+  }
+  paint();
+  return el('section', { class: 'card' },
+    el('div', { class: 'card-head' }, el('div', {}, el('h2', { text: 'Contests' }),
+      el('p', { class: 'card-sub', text: 'Every election contest that matches the filters above, across all years. Select a row to see every candidate. Winners are derived from the vote counts.' }),
+      contestScope() ? el('p', { class: 'scope-line', text: contestScope() }) : null)),
+    el('div', { class: 'members-controls' }, count), wrap, moreRow);
+}
+
+async function openContest(c) {
+  const dlg = $('#detail'), E = S.elec, raw = E.contests.get(c.id);
+  const kindLabel = c.kind + (c.special && c.kind !== 'special' ? ' (special)' : '');
+  const where = c.stateName + (c.district ? ' ' + c.district.replace(/^[A-Z]{2}-/, '') : '');
+  const resTable = tableEl([{ h: 'Candidate' }, { h: 'Party line' }, { h: 'Votes', num: 1 }, { h: 'Share', num: 1 }, { h: 'Outcome (derived)' }],
+    c.results.map(x => [x.name + (x.cand.writeIn ? ' (write-in)' : ''), x.cand.partyLabel || '', x.votes == null ? '—' : fmt(x.votes), x.share == null ? '' : pct(x.share),
+      x.outcome === 'advanced-to-runoff' ? 'advanced to runoff' : x.outcome]));
+  const person = c.winner && c.winner.cand.person ? S.persons.get(refId(c.winner.cand.person.reference)) : null;
+  const apiLinks = el('p', {}, ...[[`/Contest/${c.id}`, 'Contest'], [`/ContestResult?contest=Contest/${c.id}&_include=ContestResult:candidacy`, 'Results + candidates'], [`/Candidacy?contest=Contest/${c.id}`, 'Candidacies']]
+    .flatMap(([h, t]) => [el('a', { href: h, target: '_blank', rel: 'noopener', text: `API: ${t}` }), ' · ']).slice(0, -1));
+  dlg.replaceChildren(el('div', { class: 'dlg' },
+    el('div', { class: 'dlg-head' }, el('div', {}, el('h2', { id: 'detail-title', text: `${c.year} ${kindLabel}: ${where}` }),
+      el('p', { class: 'card-sub', text: `${CHAMBER_LABEL[chamberOf(c)]} · total votes ${c.total == null ? 'n/a' : fmt(c.total)} · ${c.reporting || 'official'}${c.uncontested ? ' · uncontested' : ''}${person ? ' · winner is a current member: ' + (person.name[0].text || '') : ''}` })),
+      el('button', { type: 'button', text: 'Close', onclick: () => dlg.close() })),
+    el('div', {}, el('h3', { text: `Candidates (${c.results.length})` }), el('div', { class: 'tablewrap' }, resTable)),
+    el('p', { class: 'hint', text: 'Outcomes are computed by polstats (plurality; runoff pairs marked), not taken from the source.' }),
+    apiLinks,
+    el('details', {}, el('summary', { text: 'Raw Contest JSON' }), el('pre', { text: JSON.stringify(raw, null, 2) }))));
+  dlg.showModal();
 }
 
 /* ---------- detail dialog ---------- */
@@ -624,9 +782,12 @@ function runChecks(rows) {
 
   if (S.elec && S.elec.contests.size) {
     const E = S.elec, sums = contestSummaries();
-    const badSum = sums.filter(c => c.results.length && Math.abs(c.results.reduce((s, x) => s + (x.share || 0), 0) - 1) > 0.002);
-    add(badSum.length ? 'fail' : 'pass', 'Election: vote shares sum to 100% in every contest',
-      badSum.length ? `${badSum.length} contests off, e.g. ${list(badSum.map(c => `${c.year} ${c.stateName}`))}` : `All ${fmt(sums.length)} contests reconcile with their total votes.`);
+    const counted = sums.filter(c => !c.uncontested && c.total != null && c.results.length);
+    const badSum = counted.filter(c => Math.abs(c.results.reduce((s, x) => s + (x.share || 0), 0) - 1) > 0.002);
+    const nUnc = sums.filter(c => c.uncontested).length;
+    add(badSum.length ? 'warn' : 'pass', 'Election: candidate votes reconcile with each contest\'s stated total',
+      (badSum.length ? `${badSum.length} of ${fmt(counted.length)} contests disagree with the source's own total by more than 0.2% (ranked-choice rounds, late corrections), e.g. ${list(badSum.map(c => `${c.year} ${c.stateName}${c.district ? ' ' + c.district.replace(/^[A-Z]{2}-/, '') : ''}`))}. These are source inconsistencies.`
+        : `All ${fmt(counted.length)} contests with vote counts reconcile with their totals.`) + ` ${fmt(nUnc)} uncontested races carry no vote counts (sources only store a placeholder).`);
 
     const noRes = sums.filter(c => !c.results.length);
     const decisive = sums.filter(c => c.kind !== 'primary');
@@ -649,10 +810,17 @@ function runChecks(rows) {
 
     const have = new Set([...E.cands.values()].filter(c => c.person).map(c => refId(c.person.reference)));
     const offices = new Set(sums.map(c => c.office));
-    const noElection = rows.filter(r => r.chamber === 'senate' && offices.has('senator') && !have.has(r.pid)).map(r => `${r.name} (${r.state})`);
-    add(noElection.length ? 'warn' : 'pass', 'Election: every sitting senator has an election in the data',
-      noElection.length ? `No election record for: ${list(noElection)}. Typically appointees who have not yet faced an election in the loaded data.` : 'Every sitting senator links to at least one winning candidacy.');
-    if (!offices.has('representative')) add('warn', 'Election: House results not loaded', 'Only Senate returns are loaded so far. The House file needs a Dataverse download form.');
+    const loadedHouse = offices.has('representative');
+    const checkChamber = (chamber, label, loaded) => {
+      if (!loaded) return;
+      const missing = rows.filter(r => r.chamber === chamber && (chamber === 'senate' || r.office === 'representative') && !have.has(r.pid))
+        .map(r => `${r.name} (${r.state}${r.district && chamber === 'house' ? '-' + r.district.replace(/^[A-Z]{2}-/, '') : ''})`);
+      add(missing.length ? 'warn' : 'pass', `Election: every sitting ${label} has an election in the data`,
+        missing.length ? `${missing.length} without an election record: ${list(missing)}. Typically people appointed or elected in a special election after the loaded data ends.` : `Every sitting ${label} links to at least one winning candidacy.`);
+    };
+    checkChamber('senate', 'senator', offices.has('senator'));
+    checkChamber('house', 'House member', loadedHouse);
+    if (!loadedHouse) add('warn', 'Election: House results not loaded', 'Only Senate returns are loaded. Fetch and load the MEDSL House file (see README).');
   }
   return out;
 }
@@ -661,17 +829,42 @@ function checksCard(rows) {
   const items = runChecks(rows);
   const label = { pass: 'Pass', warn: 'Check', fail: 'Fail' };
   const worst = items.some(i => i.level === 'fail') ? 'fail' : items.some(i => i.level === 'warn') ? 'warn' : 'pass';
-  return el('section', { class: 'card' },
-    el('div', { class: 'card-head' }, el('div', {}, el('h2', { text: 'Data checks' }),
-      el('p', { class: 'card-sub', text: `${items.filter(i => i.level === 'pass').length} of ${items.length} pass · overall: ${label[worst]}. Resources in the store:` }))),
-    counts,
-    el('ul', { class: 'checks' }, items.map(i => el('li', { class: 'check' }, ICON[i.level](),
-      el('div', {}, el('span', { class: 'state', text: label[i.level] }), el('span', { text: i.title }), el('span', { class: 'detail', text: i.detail }))))));
+  const passing = items.filter(i => i.level === 'pass').length;
+  // Collapsible and closed by default; the summary line keeps the overall result visible while closed.
+  const details = el('details', { class: 'checks-details' },
+    el('summary', {}, ICON[worst](), el('h2', { text: 'Data checks' }),
+      el('span', { class: 'card-sub', text: `${passing} of ${items.length} pass · overall: ${label[worst]}` })),
+    el('div', { class: 'checks-body' },
+      el('p', { class: 'card-sub', text: "Checks always cover the full dataset; filters don't apply. Resources in the store:" }),
+      counts,
+      el('ul', { class: 'checks' }, items.map(i => el('li', { class: 'check' }, ICON[i.level](),
+        el('div', {}, el('span', { class: 'state', text: label[i.level] }), el('span', { text: i.title }), el('span', { class: 'detail', text: i.detail })))))));
+  details.open = !!S.checksOpen;
+  details.addEventListener('toggle', () => { S.checksOpen = details.open; });   // survives re-renders and data reloads
+  return el('section', { class: 'card' }, details);
 }
 
 /* ---------- render ---------- */
+function updateBounds() {
+  const ages = S.rows.map(r => r.age).filter(a => a != null), ten = S.rows.map(r => r.tenure).filter(t => t != null);
+  if (ages.length) BOUNDS.age = [Math.floor(Math.min(...ages) / 5) * 5, Math.ceil(Math.max(...ages) / 5) * 5];
+  if (ten.length) BOUNDS.tenure = [0, Math.ceil(Math.max(...ten))];
+  if (S.elec) { const ys = [...S.elec.elections.values()].map(e => e.year); if (ys.length) BOUNDS.years = [Math.min(...ys), Math.max(...ys)]; }
+}
+function cachedChecksCard(all) {  // checks ignore the filters, so only rebuild when the data changes
+  const c = S.checksCache;
+  if (c && c.rows === S.rows && c.elec === S.elec && c.asOf === S.asOf) return c.node;
+  const node = checksCard(all);
+  S.checksCache = { rows: S.rows, elec: S.elec, asOf: S.asOf, node };
+  return node;
+}
 function render() {
-  const main = $('#main'), rows = S.rows;
+  const main = $('#main'), all = S.rows;
+  updateBounds();
+  const rows = all.filter(memberMatches);
+  const allSums = S.elec ? contestSummaries() : [];
+  S.fsums = allSums.filter(contestMatches);
+  syncFilterBar({ m: rows.length, mt: all.length, c: S.fsums.length, ct: allSums.length });
   main.replaceChildren();
   main.append(tilesSection(rows));
   if (S.asOf !== todayISO()) {
@@ -679,24 +872,33 @@ function render() {
       el('span', {}, el('strong', { text: 'Data scope. ' }),
         'Only people serving today (and their earlier terms) are loaded. For other dates this page shows just those people, not the full Congress of that date, so seat counts and the checks below will look incomplete.')));
   }
-  main.append(checksCard(rows));
+  main.append(cachedChecksCard(all));
   const g1 = el('div', { class: 'grid' }), g2 = el('div', { class: 'grid' });
   const cards = [compositionCard(rows), stateCard(rows), ageCard(rows), tenureCard(rows)];
   g1.append(cards[0].node, cards[1].node); g2.append(cards[2].node, cards[3].node);
   const g3 = el('div', { class: 'grid' });
   const elecCards = electionsSection();
   g3.append(...elecCards.map(c => c.node || c));
-  main.append(g1, g2, g3, membersCard(rows));
+  main.append(g1, g2, g3);
+  const contests = contestsCard();
+  if (contests) main.append(contests);
+  main.append(membersCard(rows));
   [...cards, ...elecCards.filter(c => c.draw)].forEach(c => c.draw());
 }
+let _pending = false;  // coalesce bursts of filter changes (slider drags) into one render per task
+const scheduleRender = () => { if (!_pending) { _pending = true; setTimeout(() => { _pending = false; render(); }, 0); } };
 
 /* ---------- boot ---------- */
 const todayISO = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
 function banner(msg) { const b = $('#banner'); b.hidden = !msg; b.textContent = msg || ''; }
+function saveHash() {
+  const h = filtersToHash({ asof: S.asOf && S.asOf !== todayISO() ? S.asOf : '' });
+  try { history.replaceState(null, '', location.pathname + location.search + (h ? '#' + h : '')); } catch (_) { /* e.g. sandboxed frame */ }
+}
 async function setDate(d) {
   const main = $('#main');
   main.classList.add('refetching'); banner('');
-  try { await loadAsOf(d); render(); }
+  try { await loadAsOf(d); saveHash(); render(); }
   catch (e) { banner(`Could not load data: ${e.message}`); }
   finally { main.classList.remove('refetching'); }
 }
@@ -717,11 +919,15 @@ function initTheme() {
 }
 async function boot() {
   initTheme();
-  const input = $('#asof'); input.value = todayISO();
-  input.onchange = () => input.value && setDate(input.value);
-  $('#today').onclick = () => { input.value = todayISO(); setDate(input.value); };
+  const start = filtersFromHash(location.hash);   // filters (and the as-of date) can come from a shared link
+  buildFilterBar({ onChange: () => { saveHash(); scheduleRender(); }, onDate: d => setDate(d) });
+  const input = FB.asof; input.value = start.asof || todayISO();
   $('#detail').addEventListener('click', e => { if (e.target === e.currentTarget) e.currentTarget.close(); });
   let t; addEventListener('resize', () => { clearTimeout(t); t = setTimeout(() => S.rows.length && render(), 150); });
+  addEventListener('hashchange', () => {   // back/forward or an edited link
+    const st = filtersFromHash(location.hash);
+    if (st.asof && st.asof !== S.asOf) { input.value = st.asof; setDate(st.asof); } else scheduleRender();
+  });
   try { await loadStatic(); await loadAsOf(input.value); render(); }
   catch (e) { $('#main').replaceChildren(); banner(`Could not load data from the API: ${e.message}`); return; }
   try { await loadElections(); } catch (e) { S.elecError = e.message; }

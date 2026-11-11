@@ -6,7 +6,7 @@ import pytest
 from polstats import codesystems as cs
 from polstats.loaders.congress_legislators import Loader as CongressLoader
 from polstats.loaders.medsl import (SYS_CONTEST, Cand, derive_outcomes, district_label, district_number,
-                                    effective_stage, kind_of, load_file, norm, party_code,
+                                    effective_stage, is_bucket_name, kind_of, load_file, norm, party_code,
                                     regular_election_day, stage_norm)
 from polstats.store import Store, dsn
 
@@ -30,6 +30,14 @@ def test_helpers():
     assert district_number("statewide") is None and district_number("000") == 0 and district_number("012") == 12
     assert district_label("VT", "0") == "VT-AL" and district_label("TX", "012") == "TX-12"
     assert district_label("TX", "statewide") is None
+    for name in ("WRITEIN", "BLANK VOTE/SCATTERING", "VOID", "UNDERVOTES", "OTHER", "SCATTERING", "",
+                 "(write-in, aggregated)", "(unnamed)", "BLANK VOTE/VOID VOTE/SCATTERING", "OVERVOTES",
+                 "EXHAUSTED BALLOT", "EXHAUSTED BALLOTS", "ALL OTHERS", "BLANKS", "MISCELLANEOUS", "SCATTER", "SPOILED",
+                 "NONE OF THESE CANDIDATES", "NONE OF THESE, CANDIDATES", "INDEPENDENT", "WORKING FAMILIES", "MODERATE"):
+        assert is_bucket_name(name), name
+    for name in ("LUCY MCBATH", "WYCHE FOWLER, JR.", "OTHERO GORDON", "BLANKENSHIP", "VOIDE", "EXHAUSTEDSON",
+                 "INDEPENDENT JONES", "MODERATE MARY", "SCATTERGOOD"):  # real names must not match
+        assert not is_bucket_name(name), name
     # Georgia-style: 'gen' that follows a 'pre' round is the runoff
     assert effective_stage("gen", True) == "runoff" and effective_stage("gen", False) == "gen"
     assert effective_stage("pre", True) == "pre" and effective_stage("GEN", True) == "runoff"
@@ -167,30 +175,84 @@ def test_load_senate_fixture(conn, tmp_path):
     assert store.find_by_identifier("Election", "urn:polstats:election", "2021:runoff")[0].date is None
 
     # idempotent: a second load creates no new versions
+    def snapshot():
+        return [conn.execute(f"SELECT count(*), COALESCE(sum(version_id), 0) FROM {t}").fetchone()
+                for t in ("contest", "candidacy", "contest_result", "provenance")]
+    before = snapshot()
     load_file(f, conn)
-    assert conn.execute("SELECT max(version_id) FROM contest_result").fetchone()[0] == 1
-    assert conn.execute("SELECT max(version_id) FROM candidacy").fetchone()[0] == 1
+    assert snapshot() == before  # same rows, same versions: nothing was rewritten
 
 
 @pytest.mark.db
 def test_load_house_style_columns(conn, tmp_path):
-    """House files use `party` (no party_detailed/party_simplified) and numeric districts."""
-    f = tmp_path / "house.tab"
-    header = ["year", "state", "state_po", "office", "district", "stage", "special", "candidate", "party",
-              "writein", "mode", "candidatevotes", "totalvotes", "unofficial", "version"]
+    """House files: comma-separated, `party` column, a separate `runoff` column, catch-all rows with party NA,
+    uncontested races stored as -1, and DC as an at-large (district 0) seat."""
+    f = tmp_path / "house.csv"
+    header = ["year", "state", "state_po", "office", "district", "stage", "runoff", "special", "candidate", "party",
+              "writein", "mode", "candidatevotes", "totalvotes", "unofficial", "version", "fusion_ticket"]
+
+    def row(year, st, dist, cand, party, votes, total, stage="GEN", runoff="NA", wi="FALSE", special="FALSE"):
+        return [str(year), st, st, "US HOUSE", str(dist), stage, runoff, special, cand, party, wi, "TOTAL",
+                str(votes), str(total), "FALSE", "1", "FALSE"]
+
     rows = [
-        ["2022", '"VERMONT"', "VT", '"US HOUSE"', "000", "gen", "FALSE", '"A. CANDIDATE"', '"DEMOCRAT"', "FALSE", "total", "700", "1000", "FALSE", "1"],
-        ["2022", '"VERMONT"', "VT", '"US HOUSE"', "000", "gen", "FALSE", '"B. CANDIDATE"', '"REPUBLICAN"', "FALSE", "total", "300", "1000", "FALSE", "1"],
-        ["2022", '"TEXAS"', "TX", '"US HOUSE"', "012", "gen", "FALSE", '"C. CANDIDATE"', '"REPUBLICAN"', "FALSE", "total", "600", "1000", "FALSE", "1"],
-        ["2022", '"TEXAS"', "TX", '"US HOUSE"', "012", "gen", "FALSE", '"D. CANDIDATE"', '"DEMOCRAT"', "FALSE", "total", "400", "1000", "FALSE", "1"],
+        # VT at-large with a write-in catch-all row (party NA) that must never win
+        row(2022, "VT", 0, "A. CANDIDATE", "DEMOCRAT", 690, 1000), row(2022, "VT", 0, "B. CANDIDATE", "REPUBLICAN", 300, 1000),
+        row(2022, "VT", 0, "WRITEIN", "NA", 10, 1000, wi="TRUE"),
+        row(2022, "TX", 12, "C. CANDIDATE", "REPUBLICAN", 600, 1000), row(2022, "TX", 12, "D. CANDIDATE", "DEMOCRAT", 400, 1000),
+        # FL uncontested: placeholder -1 votes and -1 total
+        row(2024, "FL", 20, "E. UNOPPOSED", "DEMOCRAT", -1, -1),
+        # LA 2002 style: first round (runoff FALSE) then runoff (runoff TRUE), both stage GEN
+        row(2002, "LA", 5, "F. FIRST", "REPUBLICAN", 450, 1000, runoff="FALSE"), row(2002, "LA", 5, "G. SECOND", "DEMOCRAT", 400, 1000, runoff="FALSE"),
+        row(2002, "LA", 5, "H. THIRD", "REPUBLICAN", 150, 1000, runoff="FALSE"),
+        row(2002, "LA", 5, "F. FIRST", "REPUBLICAN", 480, 1000, runoff="TRUE"), row(2002, "LA", 5, "G. SECOND", "DEMOCRAT", 520, 1000, runoff="TRUE"),
+        # NY-style fusion: the Working Families line out-polls the Democratic line, but party must be D;
+        # the stated total (900) excludes the BLANK row, so blank gets no vote share and is not a mismatch
+        row(2022, "NY", 1, "K. FUSION", "DEMOCRAT", 200, 900), row(2022, "NY", 1, "K. FUSION", "WORKING FAMILIES", 300, 900),
+        row(2022, "NY", 1, "L. REP", "REPUBLICAN", 400, 900), row(2022, "NY", 1, "BLANK", "NA", 50, 900),
+        # DC delegate seat
+        row(2022, "DC", 0, "I. DELEGATE", "DEMOCRAT", 800, 1000), row(2022, "DC", 0, "J. OTHER", "REPUBLICAN", 200, 1000),
     ]
-    f.write_text("\t".join(header) + "\n" + "\n".join("\t".join(r) for r in rows) + "\n")
+    f.write_text(",".join(header) + "\n" + "\n".join(",".join(r) for r in rows) + "\n")
     _, metrics = load_file(f, conn)
-    assert metrics.get("vote_sum_mismatch", 0) == 0
+    assert metrics.get("vote_sum_mismatch", 0) == 0 and metrics["uncontested"] == 1  # NY blank row is not a mismatch
+
+    def code_of(res):
+        return res["outcome"]["coding"][0]["code"]
+
     vt = results_for(conn, "2022:general:VT:representative:VT-AL")
-    assert vt["A. CANDIDATE"][0]["outcome"]["coding"][0]["code"] == "won" and vt["B. CANDIDATE"][0]["partyCode"] == "R"
-    tx = results_for(conn, "2022:general:TX:representative:TX-12")
-    assert tx["C. CANDIDATE"][0]["outcome"]["coding"][0]["code"] == "won"
+    assert code_of(vt["A. CANDIDATE"][0]) == "won" and vt["B. CANDIDATE"][0]["partyCode"] == "R"
+    assert code_of(vt["WRITEIN"][0]) == "lost" and "partyLabel" not in vt["WRITEIN"][1]  # "NA" is not a party
+    assert vt["WRITEIN"][1]["writeIn"] is True
+    assert code_of(results_for(conn, "2022:general:TX:representative:TX-12")["C. CANDIDATE"][0]) == "won"
+
+    fl = results_for(conn, "2024:general:FL:representative:FL-20")
+    unopposed, _ = fl["E. UNOPPOSED"]
+    assert "votes" not in unopposed and "voteShare" not in unopposed and code_of(unopposed) == "won"
+    contest = store_contest(conn, "2024:general:FL:representative:FL-20")
+    assert contest["uncontested"] is True and "totalVotes" not in contest
+
+    first = results_for(conn, "2002:general:LA:representative:LA-5")
+    assert {n: code_of(v[0]) for n, v in first.items()} == {
+        "F. FIRST": "advanced-to-runoff", "G. SECOND": "advanced-to-runoff", "H. THIRD": "lost"}
+    runoff = results_for(conn, "2002:runoff:LA:representative:LA-5")
+    assert {n: code_of(v[0]) for n, v in runoff.items()} == {"F. FIRST": "lost", "G. SECOND": "won"}
+
+    ny = results_for(conn, "2022:general:NY:representative:NY-1")
+    k, k_cand = ny["K. FUSION"]
+    assert k["votes"] == 500 and k["partyCode"] == "D" and k_cand["partyLabel"] == "DEMOCRAT" and code_of(k) == "won"
+    assert ny["BLANK"][0]["votes"] == 50 and "voteShare" not in ny["BLANK"][0]  # a ballot, not a vote
+    assert abs(k["voteShare"] - 500 / 900) < 1e-6
+
+    dc = store_contest(conn, "2022:general:DC:delegate:DC-AL")  # DC sends a delegate, not a voting representative
+    assert dc["office"]["coding"][0]["code"] == "delegate"
+
+
+def store_contest(conn, ckey):
+    row = conn.execute("SELECT resource FROM contest WHERE resource -> 'identifier' @> %s::jsonb",
+                       ('[{"system": "%s", "value": "%s"}]' % (SYS_CONTEST, ckey),)).fetchone()
+    assert row, ckey
+    return row[0]
 
 
 @pytest.mark.db

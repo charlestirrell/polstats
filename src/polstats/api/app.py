@@ -4,14 +4,18 @@
     GET  /{Type}?param=value&_count=&_offset=&_include=Type:field     -> Bundle (searchset)
     GET  /{Type}/{id}                                                  -> resource (+ETag)
     GET  /{Type}/{id}/_history                                         -> Bundle (history)
-    POST /{Type}                                                       -> 201 + Location
-    PUT  /{Type}/{id}      (honours If-Match: W/"<version>")
+    POST /{Type}                                                       -> 201 + Location   (writes)
+    PUT  /{Type}/{id}      (honours If-Match: W/"<version>")                                   (writes)
+
+The API is READ-ONLY by default. POST and PUT answer 403 unless POLSTATS_ALLOW_WRITES=1 is set, because there is no
+authentication: enable writes only on a machine you control, never on a network-facing deployment.
 
 Local-development service: no authentication. Bind to localhost only.
 Run:  PYTHONPATH=src uv run uvicorn polstats.api.app:app --port 8000
 """
 from __future__ import annotations
 
+import os
 import uuid
 from pathlib import Path
 from typing import Iterator
@@ -35,6 +39,21 @@ def outcome(status: int, severity: str, code: str, text: str, headers: dict | No
         {"resourceType": "OperationOutcome",
          "issue": [{"severity": severity, "code": code, "diagnostics": text}]},
         status_code=status, headers=headers)
+
+
+class WritesDisabled(Exception):
+    pass
+
+
+def writes_enabled() -> bool:
+    """Read at request time (not import time) so it can be toggled per process or per test."""
+    return os.environ.get("POLSTATS_ALLOW_WRITES", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def require_writes() -> None:
+    if not writes_enabled():
+        raise WritesDisabled("this server is read-only; start it with POLSTATS_ALLOW_WRITES=1 to enable POST and PUT "
+                             "(there is no authentication, so only do this on a machine you control)")
 
 
 def get_conn() -> Iterator[psycopg.Connection]:
@@ -75,6 +94,10 @@ def create_app() -> FastAPI:
     async def _bad(_: Request, exc: BadRequest):
         return outcome(400, "error", "invalid", str(exc))
 
+    @app.exception_handler(WritesDisabled)
+    async def _forbidden(_: Request, exc: WritesDisabled):
+        return outcome(403, "error", "forbidden", str(exc))
+
     @app.exception_handler(LookupError)
     async def _missing(_: Request, exc: LookupError):
         return outcome(404, "error", "not-found", str(exc.args[0]) if exc.args else "not found")
@@ -86,7 +109,8 @@ def create_app() -> FastAPI:
             "software": {"name": "polstats", "version": "0.1.0"},
             "rest": [{"mode": "server", "resource": [
                 {"type": t,
-                 "interaction": [{"code": c} for c in ("read", "vread-history", "search-type", "create", "update")],
+                 "interaction": [{"code": c} for c in ("read", "vread-history", "search-type",
+                                                       *(("create", "update") if writes_enabled() else ()))],
                  "searchParam": [{"name": n} for n in sorted(params_for(t))],
                  "searchInclude": [f"{t}:{f}" for f in INCLUDES.get(t, {})]}
                 for t in sorted(REGISTRY)]}],
@@ -175,7 +199,8 @@ def create_app() -> FastAPI:
             raise BadRequest("; ".join(f"{'.'.join(map(str, x['loc']))}: {x['msg']}" for x in e.errors()))
 
     @app.post("/{rtype}", status_code=201)
-    async def create(rtype: str, request: Request, conn: psycopg.Connection = Depends(get_conn)):
+    async def create(rtype: str, request: Request, _w: None = Depends(require_writes),
+                     conn: psycopg.Connection = Depends(get_conn)):
         cls = _cls(rtype)
         try:
             body = await request.json()
@@ -188,7 +213,8 @@ def create_app() -> FastAPI:
                             headers={"Location": f"/{rtype}/{saved.id}/_history/1", "ETag": _etag(doc)})
 
     @app.put("/{rtype}/{rid}")
-    async def update(rtype: str, rid: str, request: Request, conn: psycopg.Connection = Depends(get_conn)):
+    async def update(rtype: str, rid: str, request: Request, _w: None = Depends(require_writes),
+                     conn: psycopg.Connection = Depends(get_conn)):
         cls = _cls(rtype)
         try:
             body = await request.json()

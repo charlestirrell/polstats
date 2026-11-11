@@ -147,8 +147,27 @@ def test_ui_is_served_and_does_not_shadow_resources(client):
     r = client.get("/ui/")
     assert r.status_code == 200 and "polstats data explorer" in r.text
     assert client.get("/ui/app.js").status_code == 200
+    assert client.get("/ui/filters.js").status_code == 200 and client.get("/ui/style.css").status_code == 200
     assert client.get("/", follow_redirects=False).headers["location"] == "/ui/"
     assert client.get("/Person?_count=0").json()["resourceType"] == "Bundle"
+
+
+def test_api_is_read_only_unless_writes_are_enabled(client, monkeypatch):
+    monkeypatch.delenv("POLSTATS_ALLOW_WRITES", raising=False)
+    body = {"resourceType": "Organization", "name": "Should Not Exist"}
+    for r in (client.post("/Organization", json=body),
+              client.put("/Organization/00000000-0000-0000-0000-000000000000", json=body)):
+        assert r.status_code == 403 and r.json()["resourceType"] == "OperationOutcome"
+        assert "POLSTATS_ALLOW_WRITES" in r.json()["issue"][0]["diagnostics"]
+    assert client.get("/Organization", params={"name": "Should Not Exist"}).json()["total"] == 0
+    assert client.get("/Person?_count=0").status_code == 200  # reads are unaffected
+    interactions = [i["code"] for i in client.get("/metadata").json()["rest"][0]["resource"][0]["interaction"]]
+    assert "create" not in interactions and "update" not in interactions and "read" in interactions
+    for falsy in ("0", "false", "", "no"):
+        monkeypatch.setenv("POLSTATS_ALLOW_WRITES", falsy)
+        assert client.post("/Organization", json=body).status_code == 403, falsy
+    monkeypatch.setenv("POLSTATS_ALLOW_WRITES", "true")
+    assert client.post("/Organization", json={"resourceType": "Organization", "name": "Writes On"}).status_code == 201
 
 
 def test_metadata(client):

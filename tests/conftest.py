@@ -22,4 +22,5 @@ def _setup() -> None:
     os.environ["POLSTATS_DSN"] = psycopg.conninfo.make_conninfo(**info)
 
 
+os.environ["POLSTATS_ALLOW_WRITES"] = "1"  # tests exercise POST/PUT; the default (off) has its own test
 _setup()

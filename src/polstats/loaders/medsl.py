@@ -34,6 +34,7 @@ from ..datatypes import Identifier, Reference
 from ..resources import (Candidacy, Contest, ContestResult, Election, Organization, Provenance, Resource)
 from ..store import Store, dsn
 from .congress_legislators import Loader as GeoLoader
+from .congress_legislators import office_code
 
 SOURCE = "MIT Election Data and Science Lab"
 SOURCE_URL = "https://electionlab.mit.edu/data"
@@ -44,14 +45,30 @@ SYS_CANDIDACY = "urn:polstats:candidacy"
 SYS_RESULT = "urn:polstats:contest-result"
 SYS_PROV = "urn:polstats:provenance"
 
-BUCKETS = {"", "OTHER", "OTHERS", "SCATTERING", "SCATTER", "WRITE-IN", "WRITEIN", "BLANK", "VOID", "OVER VOTES",
-           "UNDER VOTES"}
+# Catch-all rows that are not people: write-ins, scattering, blanks, void/spoiled/under/over votes, ranked-choice
+# "exhausted ballots", "other", and party names used in place of a candidate name.
+BUCKET_RX = re.compile(r"^(WRITE ?IN|OTHERS?|ALL OTHERS|SCATTER(ING)?|BLANKS?|VOID|SPOILED|UNDER ?VOTES?|OVER ?VOTES?|"
+                       r"NONE OF THE ABOVE|NONE OF THESE|MISCELLANEOUS|EXHAUSTED( BALLOTS?)?|UNNAMED)( |$)")
+BUCKET_EXACT = {"INDEPENDENT", "WORKING FAMILIES", "MODERATE", "NO NAME"}
 
 
 # ---------- pure helpers (unit-tested) ----------
 def norm(s: str) -> str:
     s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
     return re.sub(r"[^A-Z0-9]+", " ", s.upper()).strip()
+
+
+# Rows that are ballots but not votes for anyone; some states' stated totals exclude them.
+NONVOTE_RX = re.compile(r"^(BLANKS?|VOID|SPOILED|UNDER ?VOTES?|OVER ?VOTES?)( |$)")
+
+
+def is_nonvote_name(name: str) -> bool:
+    return bool(NONVOTE_RX.match(norm(name)))
+
+
+def is_bucket_name(name: str) -> bool:
+    n = norm(name)
+    return not n or n in BUCKET_EXACT or bool(BUCKET_RX.match(n))
 
 
 def party_code(detailed: str, simplified: str = "") -> str:
@@ -123,11 +140,17 @@ class Cand:
     outcome: str | None = None
 
     def _top(self) -> tuple[str, int, str]:
-        return max(self.lines, key=lambda l: l[1]) if self.lines else ("", 0, "")
+        """The candidate's primary party line: the best-supported major-party (D/R) line if any (fusion tickets
+        list the same person under several parties), otherwise the line with the most votes."""
+        if not self.lines:
+            return ("", 0, "")
+        major = [l for l in self.lines if party_code(l[0], l[2]) in ("D", "R")]
+        return max(major or self.lines, key=lambda l: l[1])
 
     @property
     def label(self) -> str:
-        return self._top()[0]
+        label = self._top()[0]
+        return "" if label.upper() == "NA" else label  # "NA" = no party recorded (catch-all rows)
 
     @property
     def party(self) -> str:
@@ -135,7 +158,7 @@ class Cand:
 
     @property
     def is_bucket(self) -> bool:
-        return norm(self.name) in BUCKETS
+        return is_bucket_name(self.name)
 
 
 def derive_outcomes(stage: str, cands: list[Cand], total: int | None, runoff_names: set[str] | None) -> None:
@@ -175,6 +198,7 @@ class MedslLoader(GeoLoader):
         self.metrics = defaultdict(int)
         self._index: dict | None = None
         self._seen: set[str] = set()
+        self.problems: list[str] = []  # source inconsistencies worth a human look
 
     # reference data
     def party_ref(self, code: str) -> Reference:
@@ -238,10 +262,25 @@ class MedslLoader(GeoLoader):
             c.votes += v
             c.lines.append(((r.get("party_detailed") or r.get("party") or "").strip(), v, r.get("party_simplified", "")))
         cands = list(by.values())
-        total = max(int(float(r["totalvotes"])) for r in use) if all(r["totalvotes"] for r in use) else None
-        if total is not None and sum(c.votes for c in cands) != total:
+        named = [c for c in cands if not c.is_bucket]
+        totals = [int(float(r["totalvotes"])) for r in use if r["totalvotes"]]
+        total = max(totals) if totals and max(totals) > 0 else None  # sources use 0 / -1 for "unknown"
+        # Uncontested: one named candidate and only a placeholder vote (1, or -1 in Florida) -> keep no votes.
+        uncontested = len(named) == 1 and named[0].votes <= 1
+        nonvotes = [c for c in cands if is_nonvote_name(c.name)]
+        sum_all = sum(c.votes for c in cands)
+        # Some states' totals exclude blank/void ballots: then they are not votes and get no vote share.
+        total_excludes_nonvotes = bool(nonvotes) and total is not None and sum_all != total \
+            and sum_all - sum(c.votes for c in nonvotes) == total
+        if uncontested:
+            total = None
+        elif total is not None and sum_all != total and not total_excludes_nonvotes:
             self.metrics["vote_sum_mismatch"] += 1
+            self.problems.append(f"{year} {state} {dlabel or 'statewide'} {kind}: candidates sum "
+                                 f"{sum_all:,}, source total {total:,}")
         derive_outcomes(stage, cands, total, runoff_names)
+        if uncontested:
+            self.metrics["uncontested"] += 1
 
         ckey = f"{year}:{kind}{':special' if special and kind == 'runoff' else ''}:{state}:{office}:{dlabel or 'statewide'}"
         if ckey in self._seen:  # never silently overwrite: two source contests must not share a natural key
@@ -251,7 +290,7 @@ class MedslLoader(GeoLoader):
             election=self.election_ref(year, kind), office=cs.concept(cs.OFFICE, office),
             state=self.state(state),
             district=None if dnum is None else self.district(state, dnum),
-            special=special, totalVotes=total,
+            special=special, uncontested=uncontested, totalVotes=total,
             reporting="unofficial" if any(r["unofficial"] == "true" for r in rows) else "official")
         cref = self._put(contest, SYS_CONTEST, ckey)
         targets = [cref]
@@ -267,8 +306,9 @@ class MedslLoader(GeoLoader):
             candref = self._put(cand_res, SYS_CANDIDACY, nkey)
             res = ContestResult(
                 contest=cref, candidacy=candref, year=year, office=cs.concept(cs.OFFICE, office),
-                state=contest.state, partyCode=code, votes=c.votes,
-                voteShare=round(c.votes / total, 6) if total else None,
+                state=contest.state, partyCode=code, votes=None if uncontested else c.votes,
+                voteShare=None if uncontested or not total or (total_excludes_nonvotes and c in nonvotes)
+                else round(c.votes / total, 6),
                 outcome=cs.concept(cs.CONTEST_OUTCOME, c.outcome) if c.outcome else None)
             targets += [candref, self._put(res, SYS_RESULT, nkey)]
         self._put(Provenance(target=targets, source=SOURCE, sourceUrl=SOURCE_URL,
@@ -281,18 +321,22 @@ def _clean(r: dict) -> dict:
     out["special"] = out.get("special", "").lower() == "true"
     out["writein"] = out.get("writein", "").lower()
     out["unofficial"] = out.get("unofficial", "").lower()
+    out["runoff"] = out.get("runoff", "").lower()
     out["mode"] = out.get("mode", "total").lower() or "total"
     out["state_po"] = out["state_po"].upper()
     return out
 
 
-def load_file(path: Path, conn: psycopg.Connection) -> tuple[dict[str, int], dict[str, int]]:
+def load_file(path: Path, conn: psycopg.Connection) -> tuple[dict[str, int], dict[str, object]]:
     raw = path.read_bytes()
     text = raw.decode("utf-8-sig").splitlines()
     # Dataverse's converted .tab exports are tab-separated; the original uploads (what polstats.fetch
     # downloads) may be comma- or tab-separated. Sniff from the header line.
     delimiter = "\t" if text and "\t" in text[0] else ","
     rows = [_clean(r) for r in csv.DictReader(text, delimiter=delimiter)]
+    for r in rows:  # House files flag runoff elections in a separate column rather than in `stage`
+        if r["runoff"] == "true":
+            r["stage"] = "runoff"
     store = Store(conn)
     store.init_schema()
     recorded = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).date().isoformat()
@@ -315,7 +359,8 @@ def load_file(path: Path, conn: psycopg.Connection) -> tuple[dict[str, int], dic
 
     for key in sorted(contests, key=lambda k: (k[0], k[1], k[2], k[3])):
         year, state, special, stage, dist = key
-        office = "senator" if "SENATE" in contests[key][0].get("office", "").upper() else "representative"
+        office = ("senator" if "SENATE" in contests[key][0].get("office", "").upper()
+                  else office_code("rep", state))  # representative, or delegate for DC
         related = None
         if stage_norm(eff[key]) == "gen":
             names = set()
@@ -324,7 +369,7 @@ def load_file(path: Path, conn: psycopg.Connection) -> tuple[dict[str, int], dic
                     names |= rn
             related = names or None
         loader.load_contest(key, contests[key], office, related, stage=eff[key])
-    return loader.counts, dict(loader.metrics)
+    return loader.counts, {**loader.metrics, "mismatch_examples": loader.problems[:15]}
 
 
 def main(argv: list[str]) -> int:
@@ -334,7 +379,12 @@ def main(argv: list[str]) -> int:
     with psycopg.connect(dsn()) as conn:
         counts, metrics = load_file(Path(argv[1]), conn)
     print("upserted:", counts)
+    examples = metrics.pop("mismatch_examples", [])
     print("metrics:", metrics)
+    if examples:
+        print("source inconsistencies (first 15; candidate votes vs stated total):")
+        for e in examples:
+            print("  -", e)
     return 0
 
 
