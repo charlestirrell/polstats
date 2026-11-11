@@ -240,6 +240,14 @@ compliance target, and nothing in the project depends on knowing FHIR.
 - Maine's ranked-choice rounds, Georgia's `pre`/`gen` runoff labelling and Texas/Louisiana primary runoffs are handled
   explicitly; see [docs/DESIGN.md](docs/DESIGN.md).
 
+## Disclaimer
+
+polstats is an independent, volunteer open-source project. It is not affiliated with any government body, campaign, party
+or data publisher. **It is not a source of official or certified election results.** Winners and outcomes are computed
+from the vote counts the sources provide (see [Known limitations](#known-limitations)), and the data may contain errors
+inherited from those sources. For authoritative results, use the official sources: state election offices, the Clerk of
+the House and the Secretary of the Senate. The software is provided as is, without warranty (see [LICENSE](LICENSE)).
+
 ## Roadmap
 
 - Load historical members so any past date is complete
@@ -252,7 +260,9 @@ compliance target, and nothing in the project depends on knowing FHIR.
 ## Contributing
 
 Contributions are welcome: new sources, loaders, tests, data-quality checks and docs. See
-[CONTRIBUTING.md](CONTRIBUTING.md) for setup, conventions, and how to add a data source.
+[CONTRIBUTING.md](CONTRIBUTING.md) for setup, conventions, and how to add a data source. Please follow the
+[Code of Conduct](CODE_OF_CONDUCT.md). To report a security problem, see [SECURITY.md](SECURITY.md); please don't open a
+public issue for it.
 
 ## Acknowledgements
 

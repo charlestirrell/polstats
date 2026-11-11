@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: the workflow only needs to read the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Same Postgres major version and development credentials as docker-compose.yml.
+    # The database exists only for the lifetime of this job and is not reachable from outside it.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: polstats
+          POSTGRES_PASSWORD: polstats_dev
+          POSTGRES_DB: polstats
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U polstats"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      # Third-party actions are pinned to full commit SHAs (the comment names the release);
+      # Dependabot keeps them current.
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Install dependencies (exactly as locked)
+        run: uv sync --locked --python 3.12
+
+      - name: Run the test suite
+        run: uv run pytest -q

@@ -8,7 +8,8 @@ Thanks for helping. polstats is MIT-licensed; by contributing you agree your wor
   be accepted; changes that make provenance, caveats and uncertainty clearer are very welcome.
 - **No data in the repo.** Raw datasets and personal details never get committed. `tests/test_repo_hygiene.py`
   enforces this. Describe data in `sources.toml` instead; do not check it in.
-- **Be kind.** Assume good faith, keep review comments about the code, and help newcomers.
+- **Be kind.** Follow the [Code of Conduct](CODE_OF_CONDUCT.md). Assume good faith, keep review comments about the code,
+  and help newcomers.
 
 ## Development setup
 
@@ -58,6 +59,6 @@ Tests that need Postgres use a separate `polstats_test` database and skip if the
 
 ## Reporting security issues
 
-There is no authentication yet. The API is read-only by default (writes need `POLSTATS_ALLOW_WRITES=1`) and is intended
-for local use. If you find a vulnerability, please open a
+See [SECURITY.md](SECURITY.md). There is no authentication yet. The API is read-only by default (writes need
+`POLSTATS_ALLOW_WRITES=1`) and is intended for local use. If you find a vulnerability, please open a
 private security advisory on the repository rather than a public issue.
